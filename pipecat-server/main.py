@@ -141,8 +141,58 @@ def make_llm(spec: str, keys: dict):
     if provider == "anthropic":
         from pipecat.services.anthropic.llm import AnthropicLLMService
         return AnthropicLLMService(api_key=key(keys, "anthropic", "ANTHROPIC_API_KEY"), model=model or "claude-sonnet-4-5")
-    from pipecat.services.google.llm import GoogleLLMService
-    return GoogleLLMService(api_key=key(keys, "gemini", "GEMINI_API_KEY"), model=current_gemini(model))
+    return FallbackGoogleLLM(api_key=key(keys, "gemini", "GEMINI_API_KEY"), model=current_gemini(model))
+
+
+# Models the saved Google key answered for (see src/lib/model-catalog.ts). Tried in order when the chosen
+# model is overloaded (503), rate-limited (429), missing (404) or slow, so the caller always gets a reply.
+GEMINI_FALLBACKS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-3.6-flash", "gemini-3.5-flash"]
+FIRST_TOKEN_TIMEOUT = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT", "6"))
+
+from pipecat.services.google.llm import GoogleLLMService  # noqa: E402
+
+
+class FallbackGoogleLLM(GoogleLLMService):
+    """Gemini with per-model timeout and automatic fallback.
+
+    On 26 Oct gemini-3.5-flash hung 45 s and then answered 503 "high demand": the caller heard silence.
+    """
+
+    async def _stream_content(self, params_from_context):
+        messages = params_from_context["messages"]
+        if messages and getattr(messages[-1], "role", None) == "model":
+            # Gemini rejects requests ending with a model turn (400); nothing new to answer yet.
+            async def _empty():
+                if False:
+                    yield None
+            return _empty()
+        chosen = self._settings.model
+        models = [chosen] + [m for m in GEMINI_FALLBACKS if m != chosen]
+        last_error = None
+        for model in models:
+            self._settings.model = model
+            try:
+                stream = await asyncio.wait_for(super()._stream_content(params_from_context), FIRST_TOKEN_TIMEOUT)
+                first = await asyncio.wait_for(stream.__anext__(), FIRST_TOKEN_TIMEOUT)
+            except StopAsyncIteration:
+                first, stream = None, None
+            except Exception as e:  # 503 / 429 / 404 / timeout -> next model
+                last_error = e
+                logger.warning(f"LLM {model} failed ({type(e).__name__}: {str(e)[:120]}); trying next model")
+                continue
+            finally:
+                self._settings.model = chosen
+            if model != chosen:
+                logger.info(f"LLM answered with fallback model {model}")
+
+            async def _chain(first=first, stream=stream):
+                if first is not None:
+                    yield first
+                if stream is not None:
+                    async for chunk in stream:
+                        yield chunk
+            return _chain()
+        raise last_error or RuntimeError("all Gemini models failed")
 
 
 # Google retired the Gemini 2.x models: a retired name makes the agent hear the caller but never reply.
@@ -499,7 +549,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "phone-no-barge-in-2026-10-26"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "llm-fallback-2026-10-26"}
 
 
 @app.websocket("/ws")
