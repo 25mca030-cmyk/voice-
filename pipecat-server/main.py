@@ -22,7 +22,6 @@ import httpx
 from fastapi import FastAPI, WebSocket
 from loguru import logger
 
-from pipecat.audio.interruptions.min_words_interruption_strategy import MinWordsInterruptionStrategy
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
@@ -39,6 +38,7 @@ from pipecat.frames.frames import (
     TransportMessageUrgentFrame,
     TTSSpeakFrame,
     TTSTextFrame,
+    UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
@@ -79,6 +79,16 @@ LANG_CODES = {
 }
 
 app = FastAPI(title="VoiceOS Pipecat")
+
+# Load the heavy provider SDKs once at boot. Importing them on the first call took ~30 s on Render,
+# so the caller heard silence and hung up before the agent was ready.
+try:
+    from pipecat.services.google.llm import GoogleLLMService as _GoogleLLM  # noqa: F401
+    from pipecat.services.sarvam.stt import SarvamSTTService as _SarvamSTT  # noqa: F401
+    import sarvam_flash as _sarvam_flash  # noqa: F401
+    SileroVADAnalyzer()  # downloads/loads the VAD model now, not during a call
+except Exception as _e:  # pragma: no cover
+    logger.warning(f"preload skipped: {_e}")
 
 
 # ---------------------------------------------------------------- VoiceOS bridge (signed)
@@ -283,8 +293,9 @@ class OpeningGuard(FrameProcessor):
             if isinstance(frame, BotStoppedSpeakingFrame) or time.time() - self._open_at > self._max_secs:
                 self._done = True
                 logger.info("greeting finished; listening to caller")
-            elif isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
-                return  # drop caller audio while the greeting plays
+            elif direction == FrameDirection.DOWNSTREAM and isinstance(
+                frame, (InputAudioRawFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame)):
+                return  # drop caller audio/VAD while the greeting plays (no STT flush errors)
         await self.push_frame(frame, direction)
 
 
@@ -438,14 +449,14 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         agg.assistant(),
     ])
     task = PipelineTask(pipeline, params=PipelineParams(
-        allow_interruptions=True,
+        # Phone lines carry noise and echo that kept cancelling the agent's speech before the caller heard
+        # anything. On phone calls the agent always finishes its sentence, then listens.
+        allow_interruptions=not phone,
         enable_metrics=True,
         enable_usage_metrics=True,
         audio_in_sample_rate=16000,
         # Vobiz/Plivo playAudio only accepts L16 at 8000 or 16000 Hz; 24 kHz audio is never played.
         audio_out_sample_rate=16000 if phone else 24000,
-        # Phone: a single "okay"/"hmm" (or echo) must not cut the agent off mid-sentence.
-        interruption_strategies=[MinWordsInterruptionStrategy(min_words=2)] if phone else [],
     ))
     task_ref["task"] = task
 
@@ -488,7 +499,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "phone-16k-audio-2026-10-26"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "phone-no-barge-in-2026-10-26"}
 
 
 @app.websocket("/ws")
