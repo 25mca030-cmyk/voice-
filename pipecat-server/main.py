@@ -22,10 +22,12 @@ import httpx
 from fastapi import FastAPI, WebSocket
 from loguru import logger
 
+from pipecat.audio.interruptions.min_words_interruption_strategy import MinWordsInterruptionStrategy
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     EndFrame,
     ErrorFrame,
     Frame,
@@ -130,7 +132,15 @@ def make_llm(spec: str, keys: dict):
         from pipecat.services.anthropic.llm import AnthropicLLMService
         return AnthropicLLMService(api_key=key(keys, "anthropic", "ANTHROPIC_API_KEY"), model=model or "claude-sonnet-4-5")
     from pipecat.services.google.llm import GoogleLLMService
-    return GoogleLLMService(api_key=key(keys, "gemini", "GEMINI_API_KEY"), model=model or "gemini-2.5-flash")
+    return GoogleLLMService(api_key=key(keys, "gemini", "GEMINI_API_KEY"), model=current_gemini(model))
+
+
+# Google retired the Gemini 2.x models: a retired name makes the agent hear the caller but never reply.
+def current_gemini(model: str) -> str:
+    model = (model or "").strip()
+    if not model or model.startswith(("gemini-2.", "gemini-1.")):
+        return "gemini-3.5-flash-lite" if "lite" in model else "gemini-3.5-flash"
+    return model
 
 
 # ---------------------------------------------------------------- serializers
@@ -167,7 +177,7 @@ class BrowserSerializer(FrameSerializer):
 
 
 class VobizSerializer(FrameSerializer):
-    """Vobiz/Plivo-compatible stream: L16 16 kHz in, L16 24 kHz playAudio out, clearAudio on barge-in."""
+    """Vobiz/Plivo-compatible stream: L16 16 kHz in, L16 16 kHz playAudio out, clearAudio on barge-in."""
 
     def __init__(self, stream_id: str, on_close):
         super().__init__()
@@ -253,6 +263,31 @@ class CallErrors(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class OpeningGuard(FrameProcessor):
+    """Phone only: keep line noise/echo away from STT until the greeting has finished playing.
+
+    Sarvam turns a stray "okay"/"hmm" into a user turn, which cancelled the greeting within 0.2 s.
+    """
+
+    def __init__(self, max_secs: float = 12.0):
+        super().__init__()
+        self._open_at = None
+        self._max_secs = max_secs
+        self._done = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if not self._done:
+            if self._open_at is None:
+                self._open_at = time.time()
+            if isinstance(frame, BotStoppedSpeakingFrame) or time.time() - self._open_at > self._max_secs:
+                self._done = True
+                logger.info("greeting finished; listening to caller")
+            elif isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
+                return  # drop caller audio while the greeting plays
+        await self.push_frame(frame, direction)
+
+
 def add_turn(stats: dict, role: str, text: str):
     t = stats["transcript"]
     if t and t[-1]["role"] == role:
@@ -263,7 +298,7 @@ def add_turn(stats: dict, role: str, text: str):
 
 def build_services(agent: dict, keys: dict):
     stt = make_stt(agent.get("stt", "deepgram"), agent.get("language", "English"), keys)
-    llm = make_llm(agent.get("llm", "google/gemini-2.5-flash"), keys)
+    llm = make_llm(agent.get("llm") or "google/gemini-3.5-flash", keys)
     if agent.get("tts") == "sarvam":
         lang = SARVAM_LANGS.get(agent.get("language", "Hindi"), "hi-IN")
         voice = (agent.get("voice") or "shubh").removeprefix("sarvam:")
@@ -391,6 +426,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
     pipeline = Pipeline([
         transport.input(),
         CallErrors(stats),
+        *([OpeningGuard()] if phone and agent.get("opening") else []),
         Tracker(stats, "input", not phone),  # VAD, interruptions, latency
         stt,
         Tracker(stats, "stt", not phone),  # final transcriptions
@@ -406,7 +442,10 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         enable_metrics=True,
         enable_usage_metrics=True,
         audio_in_sample_rate=16000,
-        audio_out_sample_rate=24000,
+        # Vobiz/Plivo playAudio only accepts L16 at 8000 or 16000 Hz; 24 kHz audio is never played.
+        audio_out_sample_rate=16000 if phone else 24000,
+        # Phone: a single "okay"/"hmm" (or echo) must not cut the agent off mid-sentence.
+        interruption_strategies=[MinWordsInterruptionStrategy(min_words=2)] if phone else [],
     ))
     task_ref["task"] = task
 
@@ -449,7 +488,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "sarvam-phone-settings-2026-10-26"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "phone-16k-audio-2026-10-26"}
 
 
 @app.websocket("/ws")
@@ -477,6 +516,7 @@ async def phone_ws(ws: WebSocket):
             except Exception:
                 continue
             if msg.get("event") == "start":
+                logger.info(f"phone stream start: mediaFormat={msg.get('start', {}).get('mediaFormat') or msg.get('mediaFormat')}")
                 stream_id = msg.get("start", {}).get("streamId") or msg.get("streamId", "")
                 break
     except asyncio.TimeoutError:
