@@ -85,3 +85,30 @@ class Hedging(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LivePathFarewell(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_goodbye_after_greeting_hangs_up(self):
+        calls = []
+        stats = {"transcript": [], "latencies": [], "hangup": lambda: calls.append(1)}
+        inp, asst = main.Tracker(stats, "input", False), main.Tracker(stats, "assistant", False)
+        for t in (inp, asst):
+            async def push(frame, direction=FrameDirection.DOWNSTREAM):
+                return None
+            t.push_frame = push
+        await inp.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)   # greeting
+        await asst.process_frame(TTSTextFrame("Hi, this is Sam. Do you have a moment?", aggregated_by="sentence"), FrameDirection.DOWNSTREAM)
+        await inp.process_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
+        self.assertEqual(calls, [])
+        await inp.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
+        await asst.process_frame(TTSTextFrame("Thank you for your time. Goodbye!", aggregated_by="sentence"), FrameDirection.DOWNSTREAM)
+        await inp.process_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
+        self.assertEqual(calls, [1])
+
+
+class LivePipelineOrder(unittest.TestCase):
+    def test_caller_transcript_tracker_sits_next_to_model(self):
+        src = open(main.__file__).read()
+        i_user = src.index("            live_user,\n")
+        i_stt = src.index('Tracker(stats, "stt", not phone),\n            llm,')
+        self.assertLess(i_user, i_stt)
