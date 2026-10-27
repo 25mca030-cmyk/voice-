@@ -28,6 +28,11 @@ LIVE_LANGS = {
 }
 
 _GOOD: dict[str, str] = {}  # key hash -> live model that answered
+# Known-good model (answered on 27 Oct): used straight away, skipping the ~2.6 s model check.
+# If it ever fails on a call, it is forgotten and the next call runs the full check again.
+PINNED = os.environ.get("LIVE_MODEL", "gemini-3.1-flash-live-preview").strip()
+_BAD_PINNED: set[str] = set()
+SILENCE_MS = int(os.environ.get("LIVE_SILENCE_MS", "250"))
 
 
 def _hash(key: str) -> str:
@@ -54,6 +59,8 @@ async def pick_live_model(key: str) -> str | None:
     h = _hash(key)
     if h in _GOOD:
         return _GOOD[h]
+    if PINNED and h not in _BAD_PINNED:
+        return PINNED
     t = time.time()
     # Check all candidates at once (first call only), then keep the highest-priority one that answered.
     results = await asyncio.gather(*(_handshake(key, m, 4) for m in LIVE_MODELS))
@@ -66,7 +73,9 @@ async def pick_live_model(key: str) -> str | None:
 
 
 def forget_live_model(key: str):
-    _GOOD.pop(_hash(key), None)
+    h = _hash(key)
+    _GOOD.pop(h, None)
+    _BAD_PINNED.add(h)
 
 
 def live_instructions(agent: dict) -> str:
@@ -102,8 +111,9 @@ def build_live_llm(*, key: str, model: str, agent: dict, tools_schema, phone: bo
         vad=GeminiVADParams(
             start_sensitivity=StartSensitivity.START_SENSITIVITY_LOW if phone else StartSensitivity.START_SENSITIVITY_HIGH,
             end_sensitivity=EndSensitivity.END_SENSITIVITY_HIGH,
-            silence_duration_ms=400,
-            prefix_padding_ms=200,
+            # Silence before Gemini treats the caller's turn as finished: this is most of the reply delay.
+            silence_duration_ms=SILENCE_MS,
+            prefix_padding_ms=100,
         ),
     )
     llm = GeminiLiveLLMService(api_key=key, settings=settings, tools=tools_schema)

@@ -52,7 +52,7 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.frames.frames import LLMRunFrame
-from live_engine import build_live_llm, opening_message, pick_live_model
+from live_engine import build_live_llm, forget_live_model, opening_message, pick_live_model
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.serializers.base_serializer import FrameSerializer
 try:
@@ -425,8 +425,8 @@ class Tracker(FrameProcessor):
                 if self.ui:
                     await self.push_frame(TransportMessageUrgentFrame(message={"type": "session.input_transcript.delta", "delta": frame.text.strip() + " "}))
         elif self.role == "input":
-            if isinstance(frame, UserStoppedSpeakingFrame):
-                s["user_stopped"] = time.time()
+            if isinstance(frame, VADUserStoppedSpeakingFrame):
+                s["user_stopped"] = time.time() - s.get("vad_stop_secs", 0)  # moment speech actually ended
             elif isinstance(frame, BotStartedSpeakingFrame):
                 if s.get("caller_bye") or s.get("agent_bye"):
                     s["bye_reply_started"] = True
@@ -452,6 +452,24 @@ class Tracker(FrameProcessor):
                     if isinstance(d, LLMUsageMetricsData):
                         s["input_tokens"] += d.value.prompt_tokens or 0
                         s["output_tokens"] += d.value.completion_tokens or 0
+        await self.push_frame(frame, direction)
+
+
+class LiveErrors(FrameProcessor):
+    """Gemini Live failed to connect: forget the pinned model so the next call checks models again."""
+
+    def __init__(self, key: str):
+        super().__init__()
+        self._key = key
+        self._spoke = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._spoke = True
+        elif isinstance(frame, ErrorFrame) and not self._spoke:
+            logger.warning("Gemini Live failed before speaking; next call will re-check live models")
+            forget_live_model(self._key)
         await self.push_frame(frame, direction)
 
 
@@ -577,6 +595,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
     agent, keys = session["agent"], session["keys"]
     creds = {"call_id": call_id, "token": token}
     stats = {"transcript": [], "interruptions": 0, "latencies": [], "input_tokens": 0, "output_tokens": 0, "tools": []}
+    stats["vad_stop_secs"] = 0.4  # local VAD reports "stopped" this long after speech actually ends
     started = time.time()
     finished = asyncio.Event()
     task_ref: dict = {}
@@ -639,7 +658,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            audio_out_10ms_chunks=4,
+            audio_out_10ms_chunks=2,  # 20 ms packets: less buffering before the caller hears audio
             # stop_secs is the silence the agent waits for before it answers: 0.8 s added a noticeable pause
             # to every turn. Phone keeps higher confidence/volume so line noise still isn't speech.
             # Phone audio from Vobiz is quiet: min_volume 0.6 missed most real speech, so turns only ended when
@@ -710,6 +729,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         pipeline = Pipeline([
             transport.input(),
             CallErrors(stats),
+            LiveErrors(gemini_key),
             *([OpeningGuard()] if phone and agent.get("opening") else []),
             Tracker(stats, "input", not phone),  # VAD, latency, goodbye hang-up
             Tracker(stats, "stt", not phone),  # caller transcript (sent upstream by Gemini Live)
@@ -801,7 +821,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "gemini-live-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "low-latency-live-2026-10-27"}
 
 
 @app.websocket("/ws")
