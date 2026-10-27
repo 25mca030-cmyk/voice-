@@ -99,7 +99,7 @@ import sys  # noqa: E402
 logger.remove()
 logger.add(sys.stderr, level=os.environ.get("LOG_LEVEL", "INFO"))
 
-PHONE_GAIN = float(os.environ.get("PHONE_GAIN", "2.0"))
+PHONE_GAIN = float(os.environ.get("PHONE_GAIN", "1.5"))
 
 app = FastAPI(title="VoiceOS Pipecat")
 
@@ -404,7 +404,9 @@ class VobizSerializer(FrameSerializer):
             pcm = base64.b64decode(media["payload"])
             if PHONE_GAIN != 1.0 and pcm:
                 # Caller audio arrives quiet; a fixed boost (clipped) lets speech detection hear it reliably.
-                pcm = np.clip(np.frombuffer(pcm, dtype=np.int16).astype(np.float32) * PHONE_GAIN, -32768, 32767).astype(np.int16).tobytes()
+                # Soft limiter instead of hard clipping: loud callers were distorted, which garbled what Gemini heard.
+                x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) * (PHONE_GAIN / 32768.0)
+                pcm = (np.tanh(x) * 32767.0).astype(np.int16).tobytes()
             return InputAudioRawFrame(audio=pcm, sample_rate=16000, num_channels=1)
         if msg.get("event") == "stop":
             self._on_close("hangup")
@@ -462,6 +464,9 @@ class Tracker(FrameProcessor):
                     logger.info(f"turn latency {s['latencies'][-1]:.0f} ms (caller stopped -> agent audio)")
             elif isinstance(frame, BotStoppedSpeakingFrame):
                 s["bot_stopped_at"] = time.time()
+                if not s.get("greeting_done"):
+                    s["greeting_done"] = True
+                    return await self.push_frame(frame, direction)
                 # The goodbye has finished playing: end the call from our side.
                 if s.get("hangup") and (s.get("agent_bye") or (s.get("caller_bye") and s.get("bye_reply_started"))):
                     s["bye_reply_started"] = False
@@ -471,7 +476,7 @@ class Tracker(FrameProcessor):
         else:
             if isinstance(frame, TTSTextFrame) and frame.text:
                 add_turn(s, "assistant", frame.text + " ")
-                if s.get("caller_bye") is None and _AGENT_BYE.search(frame.text) and len(s["transcript"]) > 2:
+                if s.get("greeting_done") and _AGENT_BYE.search(frame.text):
                     s["agent_bye"] = True  # the agent closed the conversation itself
                 if self.ui:
                     await self.push_frame(TransportMessageUrgentFrame(message={"type": "session.output_transcript.delta", "delta": frame.text + " "}))
@@ -850,8 +855,10 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
               if phone and agent.get("opening") else []),
             VoiceClock(stats),
             Tracker(stats, "input", not phone),  # VAD, latency, goodbye hang-up
-            Tracker(stats, "stt", not phone),  # caller transcript (sent upstream by Gemini Live)
             live_user,
+            # Caller transcript: Gemini Live sends it upstream and the user aggregator swallows it, so this
+            # must sit right next to the model (it was before the aggregator: no caller text, no "bye" hang-up).
+            Tracker(stats, "stt", not phone),
             llm,
             greeter,  # instant cached greeting (or records the first one)
             Tracker(stats, "assistant", not phone),  # agent transcript
@@ -986,7 +993,7 @@ async def _keep_awake():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "always-awake-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "clear-turns-hangup-2026-10-27"}
 
 
 @app.websocket("/ws")

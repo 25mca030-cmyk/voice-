@@ -32,7 +32,9 @@ _GOOD: dict[str, str] = {}  # key hash -> live model that answered
 # If it ever fails on a call, it is forgotten and the next call runs the full check again.
 PINNED = os.environ.get("LIVE_MODEL", "gemini-3.1-flash-live-preview").strip()
 _BAD_PINNED: set[str] = set()
-SILENCE_MS = int(os.environ.get("LIVE_SILENCE_MS", "250"))
+# 250 ms cut callers off mid-sentence (the agent answered 4-66 ms after they paused) and it then
+# misunderstood them. 450 ms with low end-sensitivity lets people finish; still under a second to reply.
+SILENCE_MS = int(os.environ.get("LIVE_SILENCE_MS", "450"))
 
 
 def _hash(key: str) -> str:
@@ -234,7 +236,7 @@ def build_live_llm(*, key: str, model: str, agent: dict, tools_schema, phone: bo
             # reply at all, another waited 7 s). HIGH hears them at once; the echo guard keeps the agent's own
             # voice out, so it does not interrupt itself.
             start_sensitivity=StartSensitivity.START_SENSITIVITY_HIGH,
-            end_sensitivity=EndSensitivity.END_SENSITIVITY_HIGH,
+            end_sensitivity=EndSensitivity.END_SENSITIVITY_LOW,
             # Silence before Gemini treats the caller's turn as finished: this is most of the reply delay.
             silence_duration_ms=SILENCE_MS,
             prefix_padding_ms=100,

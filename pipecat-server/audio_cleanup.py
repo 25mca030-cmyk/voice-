@@ -15,7 +15,8 @@ from pipecat.audio.filters.base_audio_filter import BaseAudioFilter
 
 
 class NoiseGate(BaseAudioFilter):
-    def __init__(self, *, open_ratio: float = 2.0, floor_gain: float = 0.2, hold_ms: int = 300,
+    # Gentle settings: a hard gate made short pauses inside a sentence sound like silence to Gemini.
+    def __init__(self, *, open_ratio: float = 2.0, floor_gain: float = 0.4, hold_ms: int = 700,
                  highpass_hz: float = 120.0):
         self._open_ratio = open_ratio
         self._floor_gain = floor_gain
