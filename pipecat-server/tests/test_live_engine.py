@@ -20,7 +20,7 @@ class PickModel(unittest.IsolatedAsyncioTestCase):
             tried.append(model)
             return model in ("gemini-3.8-live", "gemini-2.5-flash-native-audio-preview-12-2025")
         live_engine._GOOD.clear()
-        with patch.object(live_engine, "_handshake", fake):
+        with patch.object(live_engine, "_handshake", fake), patch.object(live_engine, "PINNED", ""):
             self.assertEqual(await live_engine.pick_live_model("k"), "gemini-3.8-live")
             n = len(tried)
             self.assertEqual(await live_engine.pick_live_model("k"), "gemini-3.8-live")
@@ -30,8 +30,21 @@ class PickModel(unittest.IsolatedAsyncioTestCase):
         async def fake(key, model, timeout):
             return False
         live_engine._GOOD.clear()
-        with patch.object(live_engine, "_handshake", fake):
+        with patch.object(live_engine, "_handshake", fake), patch.object(live_engine, "PINNED", ""):
             self.assertIsNone(await live_engine.pick_live_model("other"))
+
+    async def test_pinned_model_skips_check_until_it_fails(self):
+        calls = []
+
+        async def fake(key, model, timeout):
+            calls.append(model)
+            return model == "gemini-3.8-live"
+        live_engine._GOOD.clear()
+        with patch.object(live_engine, "_handshake", fake):
+            self.assertEqual(await live_engine.pick_live_model("p"), live_engine.PINNED)
+            self.assertEqual(calls, [])
+            live_engine.forget_live_model("p")
+            self.assertEqual(await live_engine.pick_live_model("p"), "gemini-3.8-live")
 
 
 class BuildLive(unittest.TestCase):
