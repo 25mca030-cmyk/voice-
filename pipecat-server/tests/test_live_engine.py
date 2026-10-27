@@ -47,12 +47,40 @@ class PickModel(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await live_engine.pick_live_model("p"), "gemini-3.8-live")
 
 
+class LatencyClock(unittest.IsolatedAsyncioTestCase):
+    async def test_reply_time_measured_from_callers_last_sound(self):
+        import numpy as np
+        from pipecat.frames.frames import BotStartedSpeakingFrame, InputAudioRawFrame
+        from pipecat.processors.frame_processor import FrameDirection
+        stats = {"transcript": [], "latencies": []}
+        clock, tracker = main.VoiceClock(stats), main.Tracker(stats, "input", False)
+        for p in (clock, tracker):
+            async def push(frame, direction=FrameDirection.DOWNSTREAM):
+                return None
+            p.push_frame = push
+        loud = (np.ones(320, dtype=np.int16) * 3000).tobytes()
+        quiet = np.zeros(320, dtype=np.int16).tobytes()
+        await clock.process_frame(InputAudioRawFrame(audio=loud, sample_rate=16000, num_channels=1), FrameDirection.DOWNSTREAM)
+        await clock.process_frame(InputAudioRawFrame(audio=quiet, sample_rate=16000, num_channels=1), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0.05)
+        await tracker.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
+        self.assertEqual(len(stats["latencies"]), 1)
+        self.assertGreaterEqual(stats["latencies"][0], 40)
+
+    def test_fast_thinking_choice(self):
+        self.assertEqual(str(live_engine.fast_thinking("gemini-3.1-flash-live-preview").thinking_level.value), "MINIMAL")
+        self.assertEqual(live_engine.fast_thinking("gemini-2.5-flash-native-audio-preview-12-2025").thinking_budget, 0)
+
+
 class BuildLive(unittest.TestCase):
     def test_settings(self):
         llm = live_engine.build_live_llm(key="k", model="gemini-3.8-live", agent=AGENT, tools_schema=None, phone=True)
         self.assertEqual((llm._settings.model, llm._settings.voice, llm._settings.language),
                          ("models/gemini-3.8-live", "Zephyr", "hi-IN"))
         self.assertIn("goodbye", llm._settings.system_instruction)
+        fast = live_engine.build_live_llm(key="k", model="gemini-3.1-flash-live-preview", agent=AGENT, tools_schema=None,
+                                          phone=True, thinking=True)
+        self.assertEqual(str(fast._settings.thinking.thinking_level.value), "MINIMAL")
         self.assertIn("Hi, this is Sam.", live_engine.opening_message(AGENT)["content"])
 
 
@@ -71,7 +99,11 @@ class LiveCallStarts(unittest.TestCase):
 
         async def no_connect(self, *a, **k):
             return None
+
+        async def fast_ok(key, model):
+            return True
         with patch.object(main, "voiceos", fake_voiceos), patch.object(main, "pick_live_model", fake_pick), \
+                patch.object(main, "thinking_supported", fast_ok), \
                 patch("pipecat.services.google.gemini_live.llm.GeminiLiveLLMService._connect", no_connect):
             from fastapi.testclient import TestClient
             with TestClient(main.app).websocket_connect("/ws?call=c&token=t") as ws:
