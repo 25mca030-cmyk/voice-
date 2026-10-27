@@ -91,6 +91,8 @@ async def pick_live_model(key: str) -> str | None:
 
 async def thinking_supported(key: str, model: str) -> bool:
     """Checked once per model (about 0.5 s, run while the call is being set up), then cached."""
+    if model == PINNED and os.environ.get("LIVE_FAST_THINKING", "on") == "on":
+        return True  # Google accepted it for this model on every call so far; skip the ~1 s check
     if model not in _THINKING_OK:
         cfg = fast_thinking(model)
         _THINKING_OK[model] = bool(cfg) and await _handshake(key, model, 3, cfg)
@@ -158,6 +160,38 @@ def store_greeting(k: str, rate: int, pcm: bytes):
     except OSError:
         pass
     logger.info(f"greeting audio cached ({seconds:.1f} s); next calls greet instantly")
+
+
+def remember_agent_greeting(agent_id: str, k: str | None):
+    """Links a VoiceOS agent id to its greeting so the next call can greet before the agent loads."""
+    if not agent_id or not k:
+        return
+    try:
+        os.makedirs(GREETING_DIR, exist_ok=True)
+        with open(os.path.join(GREETING_DIR, f"agent-{agent_id}"), "w") as f:
+            f.write(k)
+    except OSError:
+        pass
+
+
+def greeting_for_agent(agent_id: str):
+    """(sample_rate, pcm, key) for this agent's last greeting, or None."""
+    try:
+        with open(os.path.join(GREETING_DIR, f"agent-{agent_id}")) as f:
+            k = f.read().strip()
+    except OSError:
+        return None
+    g = cached_greeting(k)
+    return (g[0], g[1], k) if g else None
+
+
+def to_phone_rate(rate: int, pcm: bytes, target: int = 16000) -> bytes:
+    if rate == target:
+        return pcm
+    import numpy as np
+    import soxr
+    samples = np.frombuffer(pcm, dtype=np.int16)
+    return soxr.resample(samples, rate, target).astype(np.int16).tobytes()
 
 
 def already_greeted_agent(agent: dict) -> dict:

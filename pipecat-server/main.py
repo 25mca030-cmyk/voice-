@@ -57,8 +57,9 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.frames.frames import LLMRunFrame
-from live_engine import (already_greeted_agent, build_live_llm, cached_greeting, forget_live_model, greeting_key,
-                         opening_message, pick_live_model, store_greeting, thinking_supported)
+from live_engine import (already_greeted_agent, build_live_llm, cached_greeting, forget_live_model, greeting_for_agent,
+                         greeting_key, opening_message, pick_live_model, remember_agent_greeting, store_greeting,
+                         thinking_supported, to_phone_rate)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.serializers.base_serializer import FrameSerializer
 try:
@@ -484,12 +485,15 @@ class Tracker(FrameProcessor):
 class GreetingPlayer(FrameProcessor):
     """Live engine: plays the cached greeting instantly, or records Gemini's greeting to cache it."""
 
-    def __init__(self, key: str | None, cached, text: str):
+    def __init__(self, key: str | None, cached, text: str, on_saved=None):
         super().__init__()
-        self._key, self._cached, self._text = key, cached, text
+        self._key, self._cached, self._text, self._on_saved = key, cached, text, on_saved
         self._recording = key is not None and cached is None
         self._pcm, self._rate = bytearray(), 24000
         self._started = False
+
+    def played_already(self):
+        self._recording = False
 
     async def play(self):
         for _ in range(150):  # frames may only be pushed once the pipeline has started (normally instant)
@@ -517,6 +521,8 @@ class GreetingPlayer(FrameProcessor):
             elif isinstance(frame, BotStoppedSpeakingFrame):
                 self._recording = False
                 store_greeting(self._key, self._rate, bytes(self._pcm))
+                if self._on_saved:
+                    self._on_saved()
         await self.push_frame(frame, direction)
 
 
@@ -662,7 +668,7 @@ def build_services(agent: dict, keys: dict, phone: bool = False):
 
 # ---------------------------------------------------------------- call runner
 async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_id: str = "", session_task=None,
-                   stream_opened_at: float | None = None):
+                   stream_opened_at: float | None = None, agent_id: str = "", pre_greeted_until: float = 0.0):
     t_open = time.time()
     t_stream = stream_opened_at or t_open
     try:
@@ -798,10 +804,19 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
                 fast = False
             g_key = greeting_key(agent, live_model)
             g_cached = cached_greeting(g_key)
+            pre_greeted = bool(pre_greeted_until) and g_cached is not None
+            if g_cached:
+                remember_agent_greeting(agent_id, g_key)
+            elif agent_id:
+                stats["remember_greeting_for"] = (agent_id, g_key)
             llm = build_live_llm(key=gemini_key, model=live_model,
                                  agent=already_greeted_agent(agent) if g_cached else agent,
                                  tools_schema=tools_schema, phone=phone, thinking=fast, speak_first=not g_cached)
-            greeter = GreetingPlayer(g_key, g_cached, (agent.get("opening") or "").strip())
+            greeter = GreetingPlayer(g_key, g_cached, (agent.get("opening") or "").strip(),
+                                     on_saved=lambda: remember_agent_greeting(*stats.get("remember_greeting_for", ("", None))))
+            if pre_greeted:
+                greeter.played_already()
+                add_turn(stats, "assistant", (agent.get("opening") or "").strip() + " ")
             logger.info(f"call {call_id[:8]} engine: gemini live ({live_model})")
         else:
             stt, llm, tts = build_services(agent, keys, phone)
@@ -828,7 +843,8 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             transport.input(),
             CallErrors(stats),
             LiveErrors(gemini_key),
-            *([OpeningGuard()] if phone and agent.get("opening") else []),
+            *([OpeningGuard(max_secs=max(0.0, pre_greeted_until - time.time()) if pre_greeted else 12.0)]
+              if phone and agent.get("opening") else []),
             VoiceClock(stats),
             Tracker(stats, "input", not phone),  # VAD, latency, goodbye hang-up
             Tracker(stats, "stt", not phone),  # caller transcript (sent upstream by Gemini Live)
@@ -885,7 +901,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         if not phone:
             await task.queue_frame(TransportMessageUrgentFrame(message={"type": "app.connected"}))
         if live_model:
-            if g_cached:
+            if g_cached and not pre_greeted:
                 await greeter.play()  # caller hears the greeting now; Gemini connects meanwhile
             await task.queue_frame(LLMRunFrame())  # Gemini Live speaks the opening (first call) / gets context
         elif agent.get("opening"):
@@ -921,9 +937,32 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             await finish()
 
 
+async def play_instant_greeting(ws: WebSocket, stream_id: str, agent_id: str, opened_at: float) -> float:
+    """Sends this agent's saved greeting to Vobiz the moment the call connects, before the agent loads.
+
+    Only pre-recorded greeting audio is played here: no API key or agent data is used until VoiceOS has
+    confirmed the call. Returns when the greeting will have finished playing (0 if none was sent).
+    """
+    g = greeting_for_agent(agent_id)
+    if not g:
+        return 0.0
+    rate, pcm, _ = g
+    pcm16 = to_phone_rate(rate, pcm)
+    step = 1280  # 40 ms at 16 kHz
+    try:
+        for i in range(0, len(pcm16), step):
+            await ws.send_text(json.dumps({"event": "playAudio", "streamId": stream_id, "media": {
+                "contentType": "audio/x-l16", "sampleRate": 16000,
+                "payload": base64.b64encode(pcm16[i:i + step]).decode()}}))
+    except Exception:
+        return 0.0
+    logger.info(f"instant greeting sent {(time.time() - opened_at) * 1000:.0f} ms after the phone stream opened")
+    return time.time() + len(pcm16) / 2 / 16000
+
+
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "instant-greeting-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "instant-greeting-2-2026-10-27"}
 
 
 @app.websocket("/ws")
@@ -963,7 +1002,13 @@ async def phone_ws(ws: WebSocket):
         logger.exception(f"phone stream failed before start: {e}")
         return
     try:
+        agent_id = ws.query_params.get("agent", "")
+        pre_greeted_until = 0.0
+        if re.fullmatch(r"[0-9a-fA-F-]{36}", agent_id or "") and stream_id:
+            pre_greeted_until = await play_instant_greeting(ws, stream_id, agent_id, stream_opened_at)
         await run_call(ws, call_id, ws.query_params.get("token", ""), phone=True, stream_id=stream_id,
-                       session_task=session_task, stream_opened_at=stream_opened_at)
+                       session_task=session_task, stream_opened_at=stream_opened_at,
+                       agent_id=agent_id if re.fullmatch(r"[0-9a-fA-F-]{36}", agent_id or "") else "",
+                       pre_greeted_until=pre_greeted_until)
     except Exception as e:
         logger.exception(f"phone call failed: {e}")
