@@ -106,7 +106,8 @@ def forget_live_model(key: str):
 
 def live_instructions(agent: dict) -> str:
     return (agent["instructions"]
-            + "\n\nThis is a live phone call: reply in 1-2 short spoken sentences unless asked for detail."
+            + "\n\nThis is a live phone call: answer immediately in one or two short spoken sentences"
+              " (under 25 words) unless asked for detail. Do not think out loud or pause before answering."
             + "\nWhen the caller says bye or wants to end the call, reply only with a short polite goodbye"
               " (for example \"Thank you for your time. Goodbye!\") in their language and ask nothing more;"
               " the call ends automatically after your goodbye.")
@@ -135,7 +136,10 @@ def build_live_llm(*, key: str, model: str, agent: dict, tools_schema, phone: bo
         # Phone lines carry hiss and echo: only clear speech should cut the agent off,
         # but the end of the caller's sentence should be detected quickly.
         vad=GeminiVADParams(
-            start_sensitivity=StartSensitivity.START_SENSITIVITY_LOW if phone else StartSensitivity.START_SENSITIVITY_HIGH,
+            # Phone audio from Vobiz is quiet: with LOW sensitivity Gemini missed callers' speech (one call got no
+            # reply at all, another waited 7 s). HIGH hears them at once; the echo guard keeps the agent's own
+            # voice out, so it does not interrupt itself.
+            start_sensitivity=StartSensitivity.START_SENSITIVITY_HIGH,
             end_sensitivity=EndSensitivity.END_SENSITIVITY_HIGH,
             # Silence before Gemini treats the caller's turn as finished: this is most of the reply delay.
             silence_duration_ms=SILENCE_MS,

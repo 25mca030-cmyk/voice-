@@ -92,6 +92,8 @@ import sys  # noqa: E402
 logger.remove()
 logger.add(sys.stderr, level=os.environ.get("LOG_LEVEL", "INFO"))
 
+PHONE_GAIN = float(os.environ.get("PHONE_GAIN", "2.0"))
+
 app = FastAPI(title="VoiceOS Pipecat")
 
 # Load the heavy provider SDKs once at boot. Importing them on the first call took ~30 s on Render,
@@ -392,7 +394,11 @@ class VobizSerializer(FrameSerializer):
         # Bidirectional streams can echo the agent's own playback as an "outbound" track. Feeding it
         # to VAD makes the agent interrupt itself (clearAudio) so the caller hears silence.
         if msg.get("event") == "media" and media.get("payload") and media.get("track", "inbound") == "inbound":
-            return InputAudioRawFrame(audio=base64.b64decode(media["payload"]), sample_rate=16000, num_channels=1)
+            pcm = base64.b64decode(media["payload"])
+            if PHONE_GAIN != 1.0 and pcm:
+                # Caller audio arrives quiet; a fixed boost (clipped) lets speech detection hear it reliably.
+                pcm = np.clip(np.frombuffer(pcm, dtype=np.int16).astype(np.float32) * PHONE_GAIN, -32768, 32767).astype(np.int16).tobytes()
+            return InputAudioRawFrame(audio=pcm, sample_rate=16000, num_channels=1)
         if msg.get("event") == "stop":
             self._on_close("hangup")
         return None
@@ -859,7 +865,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "fast-live-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "fast-live-2-2026-10-27"}
 
 
 @app.websocket("/ws")
