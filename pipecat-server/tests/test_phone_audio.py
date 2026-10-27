@@ -79,6 +79,7 @@ class SarvamAudioTests(unittest.IsolatedAsyncioTestCase):
             async def post(self, url, **kwargs):
                 calls.append((url, kwargs, self.options))
                 return types.SimpleNamespace(status_code=status, json=lambda: {"audios": [encoded] if audios is None else audios})
+        ADAPTER._CLIENT = None  # adapter keeps one shared keep-alive client
         service = ADAPTER.SarvamFlashTTSService(api_key="test-only", voice_id=voice, language="en-IN")
         with patch.object(ADAPTER.httpx, "AsyncClient", Client):
             frames = [frame async for frame in service.run_tts("Hello", "speech-context")]
