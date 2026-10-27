@@ -18,6 +18,18 @@ except ImportError:  # pragma: no cover - older Pipecat
     TTSSettings = None
 
 
+# Shared keep-alive connection: a new client per sentence paid a TLS handshake before every reply.
+_CLIENT = None
+
+
+def _client():
+    global _CLIENT
+    if _CLIENT is None or getattr(_CLIENT, "is_closed", False):
+        _CLIENT = httpx.AsyncClient(timeout=15, follow_redirects=False,
+                                    limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=120))
+    return _CLIENT
+
+
 class SarvamFlashTTSService(TTSService):
     def __init__(self, *, api_key, voice_id, language, **kwargs):
         model = "bulbul:v4-flash" if voice_id in PERSONAS else "bulbul:v2" if voice_id in LEGACY_VOICES else "bulbul:v3"
@@ -37,8 +49,8 @@ class SarvamFlashTTSService(TTSService):
         frame_context = {"context_id": context_id} if context_id is not None else {}
         yield TTSStartedFrame(**frame_context)
         try:
-            async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
-                response = await client.post(
+            if True:
+                response = await _client().post(
                     "https://api.sarvam.ai/text-to-speech",
                     headers={"api-subscription-key": self._api_key},
                     json={"text": text[:2500], "speaker": self._speaker, "model": self._model,

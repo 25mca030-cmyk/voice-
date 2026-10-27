@@ -93,16 +93,27 @@ except Exception as _e:  # pragma: no cover
 
 
 # ---------------------------------------------------------------- VoiceOS bridge (signed)
+# One keep-alive client for every VoiceOS callback: a new client per request paid a fresh TLS
+# handshake (~150-300 ms) on session start and on every tool call.
+_BRIDGE: httpx.AsyncClient | None = None
+
+
+def _bridge() -> httpx.AsyncClient:
+    global _BRIDGE
+    if _BRIDGE is None or _BRIDGE.is_closed:
+        _BRIDGE = httpx.AsyncClient(timeout=20, limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=120))
+    return _BRIDGE
+
+
 async def voiceos(path: str, payload: dict) -> dict:
     body = json.dumps(payload, separators=(",", ":"))
     ts = str(int(time.time()))
     sig = hmac.new(SECRET.encode(), f"{ts}.{body}".encode(), hashlib.sha256).hexdigest()
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(
-            f"{VOICEOS_URL}/api/public/pipecat/{path}",
-            content=body,
-            headers={"content-type": "application/json", "x-pipecat-timestamp": ts, "x-pipecat-signature": sig},
-        )
+    r = await _bridge().post(
+        f"{VOICEOS_URL}/api/public/pipecat/{path}",
+        content=body,
+        headers={"content-type": "application/json", "x-pipecat-timestamp": ts, "x-pipecat-signature": sig},
+    )
     data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
     if r.status_code >= 400:
         raise RuntimeError(data.get("error") or f"VoiceOS {path} failed ({r.status_code})")
@@ -126,11 +137,17 @@ def make_stt(provider: str, language: str, keys: dict):
     if provider == "openai":
         from pipecat.services.openai.stt import OpenAISTTService
         return OpenAISTTService(api_key=key(keys, "openai", "OPENAI_API_KEY"), model="gpt-4o-transcribe", language=code)
-    from deepgram import LiveOptions
-    from pipecat.services.deepgram.stt import DeepgramSTTService
+    # deepgram-sdk v5 (pulled in by Pipecat 0.0.108) no longer exports LiveOptions; Pipecat ships the wrapper.
+    try:
+        from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
+    except ImportError:  # older Pipecat
+        from deepgram import LiveOptions
+        from pipecat.services.deepgram.stt import DeepgramSTTService
     return DeepgramSTTService(
         api_key=key(keys, "deepgram", "DEEPGRAM_API_KEY"),
-        live_options=LiveOptions(language="multi" if code not in ("en", "hi", "es", "fr", "de") else code, model="nova-3"),
+        # Short endpointing finalises the transcript ~200 ms after speech ends instead of Deepgram's default.
+        live_options=LiveOptions(language="multi" if code not in ("en", "hi", "es", "fr", "de") else code, model="nova-3",
+                                 interim_results=True, punctuate=True, smart_format=False, endpointing=200),
     )
 
 
@@ -138,11 +155,29 @@ def make_llm(spec: str, keys: dict):
     provider, _, model = spec.partition("/")
     if provider == "openai":
         from pipecat.services.openai.llm import OpenAILLMService
-        return OpenAILLMService(api_key=key(keys, "openai", "OPENAI_API_KEY"), model=model or "gpt-4.1-mini")
+        return OpenAILLMService(api_key=key(keys, "openai", "OPENAI_API_KEY"), model=model or "gpt-4.1-mini",
+                                params=OpenAILLMService.InputParams(max_tokens=MAX_REPLY_TOKENS, temperature=0.6))
     if provider == "anthropic":
         from pipecat.services.anthropic.llm import AnthropicLLMService
-        return AnthropicLLMService(api_key=key(keys, "anthropic", "ANTHROPIC_API_KEY"), model=model or "claude-sonnet-4-5")
-    return FallbackGoogleLLM(api_key=key(keys, "gemini", "GEMINI_API_KEY"), model=current_gemini(model))
+        return AnthropicLLMService(api_key=key(keys, "anthropic", "ANTHROPIC_API_KEY"), model=model or "claude-haiku-4-5",
+                                   params=AnthropicLLMService.InputParams(max_tokens=MAX_REPLY_TOKENS, temperature=0.6))
+    return FallbackGoogleLLM(api_key=key(keys, "gemini", "GEMINI_API_KEY"), model=current_gemini(model),
+                             params=GoogleLLMService.InputParams(max_tokens=MAX_REPLY_TOKENS, temperature=0.6))
+
+
+# Spoken replies are short; a small cap keeps the model from drafting long answers.
+MAX_REPLY_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "300"))
+
+
+def thinking_for(model: str):
+    """Gemini 3 thinks by default (Pipecat only disables it for 2.5), which added seconds before the
+    first word. Voice replies need the lowest level each model accepts."""
+    m = model or ""
+    if m.startswith("gemini-2.5") and "pro" not in m:
+        return GoogleLLMService.ThinkingConfig(thinking_budget=0)
+    if m.startswith("gemini-3"):
+        return GoogleLLMService.ThinkingConfig(thinking_level="low" if "pro" in m else "minimal")
+    return None  # "-latest" aliases: leave Pipecat's default
 
 
 # Models the saved Google key answered for (see src/lib/model-catalog.ts). Tried in order when the chosen
@@ -153,7 +188,8 @@ def make_llm(spec: str, keys: dict):
 FAST_MODELS = [m.strip() for m in os.environ.get(
     "PHONE_FAST_MODELS", "gemini-3.1-flash-lite,gemini-flash-lite-latest,gemini-3.5-flash-lite").split(",") if m.strip()]
 GEMINI_FALLBACKS = ["gemini-3.5-flash", "gemini-3.6-flash"]
-FIRST_TOKEN_TIMEOUT = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT", "4"))
+# With thinking at "minimal" the fast models answer well inside 3 s; a stuck model is skipped sooner.
+FIRST_TOKEN_TIMEOUT = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT", "3"))
 # Whichever model answered last is tried first next time (shared across calls), so only the first turn
 # after an outage pays for the fallback search.
 _LAST_GOOD_MODEL: dict = {}
@@ -199,8 +235,10 @@ class FallbackGoogleLLM(GoogleLLMService):
         models = ([preferred] if preferred else []) + FAST_MODELS + [chosen] + GEMINI_FALLBACKS
         models = list(dict.fromkeys(models))
         last_error = None
+        chosen_thinking = self._settings.thinking
         for model in models:
             self._settings.model = model
+            self._settings.thinking = thinking_for(model) or chosen_thinking
             try:
                 stream = await asyncio.wait_for(super()._stream_content(params_from_context), FIRST_TOKEN_TIMEOUT)
                 first = await asyncio.wait_for(stream.__anext__(), FIRST_TOKEN_TIMEOUT)
@@ -212,6 +250,7 @@ class FallbackGoogleLLM(GoogleLLMService):
                 continue
             finally:
                 self._settings.model = chosen
+                self._settings.thinking = chosen_thinking
             if model != chosen:
                 logger.info(f"LLM answered with fallback model {model}")
             _LAST_GOOD_MODEL[chosen] = model
@@ -494,9 +533,10 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             audio_out_enabled=True,
             add_wav_header=False,
             audio_out_10ms_chunks=4,
-            # Phone lines carry noise: require longer, more confident speech before barging in.
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.75, start_secs=0.4, stop_secs=0.8, min_volume=0.6))
-            if phone else SileroVADAnalyzer(),
+            # stop_secs is the silence the agent waits for before it answers: 0.8 s added a noticeable pause
+            # to every turn. Phone keeps higher confidence/volume so line noise still isn't speech.
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.75, start_secs=0.3, stop_secs=0.45, min_volume=0.6))
+            if phone else SileroVADAnalyzer(params=VADParams(confidence=0.7, start_secs=0.2, stop_secs=0.4, min_volume=0.6)),
             serializer=serializer,
         ),
     )
@@ -535,7 +575,8 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         llm.register_function(t["name"], handler)
 
     context = OpenAILLMContext(
-        messages=[{"role": "system", "content": agent["instructions"]}],
+        messages=[{"role": "system", "content": agent["instructions"]
+                   + "\n\nThis is a live voice call: reply in 1-2 short spoken sentences unless asked for detail."}],
         tools=ToolsSchema(standard_tools=schemas) if schemas else None,
     )
     agg = llm.create_context_aggregator(context)
@@ -606,7 +647,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "fast-llm-keepalive-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "low-latency-2026-10-27"}
 
 
 @app.websocket("/ws")
