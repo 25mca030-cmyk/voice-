@@ -49,6 +49,10 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.frames.frames import LLMRunFrame
+from live_engine import build_live_llm, opening_message, pick_live_model
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.serializers.base_serializer import FrameSerializer
 try:
@@ -646,22 +650,17 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         ),
     )
 
-    try:
-        stt, llm, tts = build_services(agent, keys, phone)
-        logger.info(f"call {call_id[:8]} services: stt={type(stt).__name__} llm={agent.get('llm')} "
-                    f"tts={type(tts).__name__} voice={agent.get('voice')} lang={agent.get('language')}")
-    except Exception as e:
-        # A setup failure must end the call visibly instead of leaving a silent open line.
-        logger.exception("voice services failed to start")
-        message = str(e) if isinstance(e, ValueError) else "Voice services failed to start; check the voice server logs."
-        await finish(message)
+    # Gemini Live (one model hears and speaks) is the default; the three-step pipeline is the fallback.
+    live_model = None
+    gemini_key = key(keys, "gemini", "GEMINI_API_KEY")
+    if os.environ.get("VOICE_ENGINE", "live") == "live":
         try:
-            await ws.close()
+            live_model = await pick_live_model(gemini_key)
         except Exception:
-            pass
-        return
+            logger.exception("live model check failed; using the three-step pipeline")
 
     schemas = []
+    handlers = {}
     for t in agent.get("tools", []):
         params = t.get("parameters") or {}
         schemas.append(FunctionSchema(name=t["name"], description=t["description"],
@@ -679,7 +678,49 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
                 await task_ref["task"].queue_frame(TransportMessageUrgentFrame(message={"type": "app.tool.result", "plan": result}))
             await p.result_callback(result.get("result", result.get("error")))
 
-        llm.register_function(t["name"], handler)
+        handlers[t["name"]] = handler
+    tools_schema = ToolsSchema(standard_tools=schemas) if schemas else None
+
+    try:
+        if live_model:
+            stt = tts = None
+            llm = build_live_llm(key=gemini_key, model=live_model, agent=agent, tools_schema=tools_schema, phone=phone)
+            logger.info(f"call {call_id[:8]} engine: gemini live ({live_model})")
+        else:
+            stt, llm, tts = build_services(agent, keys, phone)
+            logger.info(f"call {call_id[:8]} services: stt={type(stt).__name__} llm={agent.get('llm')} "
+                        f"tts={type(tts).__name__} voice={agent.get('voice')} lang={agent.get('language')}")
+    except Exception as e:
+        # A setup failure must end the call visibly instead of leaving a silent open line.
+        logger.exception("voice services failed to start")
+        message = str(e) if isinstance(e, ValueError) else "Voice services failed to start; check the voice server logs."
+        await finish(message)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        return
+
+    for name, handler in handlers.items():
+        llm.register_function(name, handler)
+
+    if live_model:
+        live_context = LLMContext([opening_message(agent)])
+        live_user, live_assistant = LLMContextAggregatorPair(live_context)
+        pipeline = Pipeline([
+            transport.input(),
+            CallErrors(stats),
+            *([OpeningGuard()] if phone and agent.get("opening") else []),
+            Tracker(stats, "input", not phone),  # VAD, latency, goodbye hang-up
+            Tracker(stats, "stt", not phone),  # caller transcript (sent upstream by Gemini Live)
+            live_user,
+            llm,
+            Tracker(stats, "assistant", not phone),  # agent transcript
+            transport.output(),
+            live_assistant,
+        ])
+    else:
+        pipeline = None
 
     context = OpenAILLMContext(
         messages=[{"role": "system", "content": agent["instructions"]
@@ -687,11 +728,11 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
                    + "\nWhen the caller says bye or wants to end the call, reply only with a short polite goodbye"
                      " (for example \"Thank you for your time. Goodbye!\") in their language and ask nothing more;"
                      " the call ends automatically after your goodbye."}],
-        tools=ToolsSchema(standard_tools=schemas) if schemas else None,
+        tools=tools_schema,
     )
-    agg = llm.create_context_aggregator(context)
+    agg = None if live_model else llm.create_context_aggregator(context)
 
-    pipeline = Pipeline([
+    pipeline = pipeline or Pipeline([
         transport.input(),
         CallErrors(stats),
         *([OpeningGuard()] if phone and agent.get("opening") else []),
@@ -709,7 +750,8 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
     task = PipelineTask(pipeline, params=PipelineParams(
         # Phone lines carry noise and echo that kept cancelling the agent's speech before the caller heard
         # anything. On phone calls the agent always finishes its sentence, then listens.
-        allow_interruptions=not phone,
+        # Gemini Live only cuts in on clear speech (low start sensitivity), so callers can interrupt it.
+        allow_interruptions=bool(live_model) or not phone,
         enable_metrics=True,
         enable_usage_metrics=True,
         audio_in_sample_rate=16000,
@@ -722,7 +764,9 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
     async def _connected(_t, _c):
         if not phone:
             await task.queue_frame(TransportMessageUrgentFrame(message={"type": "app.connected"}))
-        if agent.get("opening"):
+        if live_model:
+            await task.queue_frame(LLMRunFrame())  # Gemini Live speaks the opening right away
+        elif agent.get("opening"):
             context.add_messages([{"role": "assistant", "content": agent["opening"]}])
             await task.queue_frame(TTSSpeakFrame(agent["opening"]))
 
@@ -739,7 +783,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             try:
                 await voiceos("event", {**creds, "interruptions": stats["interruptions"],
                                         "avg_latency_ms": round(sum(lat) / len(lat)) if lat else 0,
-                                        "live_status": "pipecat · live"})
+                                        "live_status": f"gemini live · {live_model}" if live_model else "pipecat · live"})
             except Exception:
                 pass
 
@@ -757,7 +801,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "fast-turns-hangup-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "gemini-live-2026-10-27"}
 
 
 @app.websocket("/ws")
