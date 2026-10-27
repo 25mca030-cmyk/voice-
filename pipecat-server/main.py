@@ -57,6 +57,7 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.frames.frames import LLMRunFrame
+from audio_cleanup import make_noise_filter
 from live_engine import (already_greeted_agent, build_live_llm, cached_greeting, forget_live_model, greeting_for_agent,
                          greeting_key, opening_message, pick_live_model, remember_agent_greeting, store_greeting,
                          thinking_supported, to_phone_rate)
@@ -769,6 +770,8 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
                 SileroVADAnalyzer(params=VADParams(confidence=0.65, start_secs=0.25, stop_secs=0.4, min_volume=0.3))
                 if phone else SileroVADAnalyzer(params=VADParams(confidence=0.7, start_secs=0.2, stop_secs=0.4, min_volume=0.6))),
             serializer=serializer,
+            # Phone calls: strip hum/rumble and turn background noise down between words (see audio_cleanup).
+            audio_in_filter=make_noise_filter() if phone else None,
         ),
     )
 
@@ -962,7 +965,7 @@ async def play_instant_greeting(ws: WebSocket, stream_id: str, agent_id: str, op
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "instant-greeting-2-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "noise-language-2026-10-27"}
 
 
 @app.websocket("/ws")

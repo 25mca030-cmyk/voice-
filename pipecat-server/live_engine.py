@@ -110,6 +110,9 @@ def live_instructions(agent: dict) -> str:
     return (agent["instructions"]
             + "\n\nThis is a live phone call: answer immediately in one or two short spoken sentences"
               " (under 25 words) unless asked for detail. Do not think out loud or pause before answering."
+            + "\nAlways reply in the language the caller is speaking (Hindi, English, Hinglish, Gujarati, Marathi, Tamil"
+              " or another Indian language) and switch when they switch. If you could not hear the caller clearly"
+              " because of background noise, briefly ask them to repeat instead of guessing."
             + "\nWhen the caller says bye or wants to end the call, reply only with a short polite goodbye"
               " (for example \"Thank you for your time. Goodbye!\") in their language and ask nothing more;"
               " the call ends automatically after your goodbye.")
