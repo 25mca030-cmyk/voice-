@@ -72,6 +72,48 @@ class LatencyClock(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(live_engine.fast_thinking("gemini-2.5-flash-native-audio-preview-12-2025").thinking_budget, 0)
 
 
+class InstantGreeting(unittest.TestCase):
+    def run_call(self, cached):
+        sent, out = [], []
+
+        async def fake_voiceos(path, payload):
+            sent.append(path)
+            return {"agent": AGENT, "keys": {"gemini": "k"}} if path == "session" else {}
+
+        async def fake_pick(key):
+            return "gemini-3.8-live"
+
+        async def ok(key, model):
+            return True
+
+        async def no_connect(self, *a, **k):
+            return None
+        with patch.object(main, "voiceos", fake_voiceos), patch.object(main, "pick_live_model", fake_pick), \
+                patch.object(main, "thinking_supported", ok), patch.object(main, "cached_greeting", lambda k: cached), \
+                patch("pipecat.services.google.gemini_live.llm.GeminiLiveLLMService._connect", no_connect):
+            from fastapi.testclient import TestClient
+            with TestClient(main.app).websocket_connect("/ws?call=c&token=t") as ws:
+                for _ in range(40):
+                    m = json.loads(ws.receive_text())
+                    out.append(m.get("type"))
+                    if m.get("type") == "audio":
+                        break
+                ws.send_text(json.dumps({"type": "session.close"}))
+        return out
+
+    def test_cached_greeting_plays_without_gemini(self):
+        out = self.run_call((24000, b"\x10\x00" * 24000))  # 1 s of audio
+        self.assertIn("audio", out)
+
+    def test_cache_key_and_store(self):
+        k = live_engine.greeting_key(AGENT, "m")
+        self.assertIsNotNone(k)
+        self.assertIsNone(live_engine.greeting_key({**AGENT, "opening": ""}, "m"))
+        live_engine.store_greeting(k, 24000, b"\x00\x00" * 24000 * 2)
+        self.assertEqual(live_engine.cached_greeting(k)[0], 24000)
+        self.assertIn("Do not greet again", live_engine.already_greeted_agent(AGENT)["instructions"])
+
+
 class BuildLive(unittest.TestCase):
     def test_settings(self):
         llm = live_engine.build_live_llm(key="k", model="gemini-3.8-live", agent=AGENT, tools_schema=None, phone=True)
