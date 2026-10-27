@@ -39,7 +39,11 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TransportMessageFrame,
     TransportMessageUrgentFrame,
+    StartFrame,
+    TTSAudioRawFrame,
     TTSSpeakFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
     TTSTextFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
@@ -53,7 +57,8 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.frames.frames import LLMRunFrame
-from live_engine import build_live_llm, forget_live_model, opening_message, pick_live_model, thinking_supported
+from live_engine import (already_greeted_agent, build_live_llm, cached_greeting, forget_live_model, greeting_key,
+                         opening_message, pick_live_model, store_greeting, thinking_supported)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.serializers.base_serializer import FrameSerializer
 try:
@@ -440,6 +445,10 @@ class Tracker(FrameProcessor):
             if isinstance(frame, VADUserStoppedSpeakingFrame):
                 s["user_stopped"] = time.time() - s.get("vad_stop_secs", 0)  # moment speech actually ended
             elif isinstance(frame, BotStartedSpeakingFrame):
+                if not s.get("greeted"):
+                    s["greeted"] = True
+                    logger.info(f"greeting started {(time.time() - s.get('t_stream', time.time())) * 1000:.0f} ms "
+                                f"after the phone stream opened")
                 lv = s.get("last_voice")
                 if lv and lv > s.get("bot_stopped_at", 0) and not s.get("user_stopped"):
                     s["latencies"].append((time.time() - lv) * 1000)
@@ -469,6 +478,45 @@ class Tracker(FrameProcessor):
                     if isinstance(d, LLMUsageMetricsData):
                         s["input_tokens"] += d.value.prompt_tokens or 0
                         s["output_tokens"] += d.value.completion_tokens or 0
+        await self.push_frame(frame, direction)
+
+
+class GreetingPlayer(FrameProcessor):
+    """Live engine: plays the cached greeting instantly, or records Gemini's greeting to cache it."""
+
+    def __init__(self, key: str | None, cached, text: str):
+        super().__init__()
+        self._key, self._cached, self._text = key, cached, text
+        self._recording = key is not None and cached is None
+        self._pcm, self._rate = bytearray(), 24000
+        self._started = False
+
+    async def play(self):
+        for _ in range(150):  # frames may only be pushed once the pipeline has started (normally instant)
+            if self._started:
+                break
+            await asyncio.sleep(0.02)
+        rate, pcm = self._cached
+        await self.push_frame(TTSStartedFrame())
+        await self.push_frame(TTSTextFrame(self._text, aggregated_by="sentence"))
+        step = rate // 10 * 2  # 100 ms per frame
+        for i in range(0, len(pcm), step):
+            await self.push_frame(TTSAudioRawFrame(bytes(pcm[i:i + step]), rate, 1))
+        await self.push_frame(TTSStoppedFrame())
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, StartFrame):
+            self._started = True
+        if self._recording:
+            if isinstance(frame, OutputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
+                self._pcm.extend(frame.audio)
+                self._rate = frame.sample_rate
+            elif isinstance(frame, _Interrupt):
+                self._recording = False  # an interrupted greeting is not worth keeping
+            elif isinstance(frame, BotStoppedSpeakingFrame):
+                self._recording = False
+                store_greeting(self._key, self._rate, bytes(self._pcm))
         await self.push_frame(frame, direction)
 
 
@@ -613,8 +661,10 @@ def build_services(agent: dict, keys: dict, phone: bool = False):
 
 
 # ---------------------------------------------------------------- call runner
-async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_id: str = "", session_task=None):
+async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_id: str = "", session_task=None,
+                   stream_opened_at: float | None = None):
     t_open = time.time()
+    t_stream = stream_opened_at or t_open
     try:
         session = await (session_task or voiceos("session", {"call_id": call_id, "token": token}))
         logger.info(f"call {call_id[:8]} agent loaded from VoiceOS in {(time.time() - t_open) * 1000:.0f} ms")
@@ -628,7 +678,8 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
     agent, keys = session["agent"], session["keys"]
     creds = {"call_id": call_id, "token": token}
     stats = {"transcript": [], "interruptions": 0, "latencies": [], "input_tokens": 0, "output_tokens": 0, "tools": []}
-    stats["vad_stop_secs"] = 0.4  # local VAD reports "stopped" this long after speech actually ends
+    stats["vad_stop_secs"] = 0.4
+    stats["t_stream"] = t_stream  # local VAD reports "stopped" this long after speech actually ends
     started = time.time()
     finished = asyncio.Event()
     task_ref: dict = {}
@@ -745,8 +796,12 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
                 fast = await asyncio.wait_for(thinking_task, 3.5)
             except Exception:
                 fast = False
-            llm = build_live_llm(key=gemini_key, model=live_model, agent=agent, tools_schema=tools_schema,
-                                 phone=phone, thinking=fast)
+            g_key = greeting_key(agent, live_model)
+            g_cached = cached_greeting(g_key)
+            llm = build_live_llm(key=gemini_key, model=live_model,
+                                 agent=already_greeted_agent(agent) if g_cached else agent,
+                                 tools_schema=tools_schema, phone=phone, thinking=fast, speak_first=not g_cached)
+            greeter = GreetingPlayer(g_key, g_cached, (agent.get("opening") or "").strip())
             logger.info(f"call {call_id[:8]} engine: gemini live ({live_model})")
         else:
             stt, llm, tts = build_services(agent, keys, phone)
@@ -767,7 +822,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         llm.register_function(name, handler)
 
     if live_model:
-        live_context = LLMContext([opening_message(agent)])
+        live_context = LLMContext([] if g_cached else [opening_message(agent)])
         live_user, live_assistant = LLMContextAggregatorPair(live_context)
         pipeline = Pipeline([
             transport.input(),
@@ -779,6 +834,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             Tracker(stats, "stt", not phone),  # caller transcript (sent upstream by Gemini Live)
             live_user,
             llm,
+            greeter,  # instant cached greeting (or records the first one)
             Tracker(stats, "assistant", not phone),  # agent transcript
             transport.output(),
             live_assistant,
@@ -829,7 +885,9 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         if not phone:
             await task.queue_frame(TransportMessageUrgentFrame(message={"type": "app.connected"}))
         if live_model:
-            await task.queue_frame(LLMRunFrame())  # Gemini Live speaks the opening right away
+            if g_cached:
+                await greeter.play()  # caller hears the greeting now; Gemini connects meanwhile
+            await task.queue_frame(LLMRunFrame())  # Gemini Live speaks the opening (first call) / gets context
         elif agent.get("opening"):
             context.add_messages([{"role": "assistant", "content": agent["opening"]}])
             await task.queue_frame(TTSSpeakFrame(agent["opening"]))
@@ -865,7 +923,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "fast-live-2-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "instant-greeting-2026-10-27"}
 
 
 @app.websocket("/ws")
@@ -877,6 +935,7 @@ async def browser_ws(ws: WebSocket):
 @app.websocket("/phone")
 async def phone_ws(ws: WebSocket):
     await ws.accept()
+    stream_opened_at = time.time()
     call_id = ws.query_params.get("call", "")
     logger.info(f"phone stream opened for call {call_id[:8]}")
     # Load the agent while Vobiz is still sending its start event.
@@ -905,6 +964,6 @@ async def phone_ws(ws: WebSocket):
         return
     try:
         await run_call(ws, call_id, ws.query_params.get("token", ""), phone=True, stream_id=stream_id,
-                       session_task=session_task)
+                       session_task=session_task, stream_opened_at=stream_opened_at)
     except Exception as e:
         logger.exception(f"phone call failed: {e}")

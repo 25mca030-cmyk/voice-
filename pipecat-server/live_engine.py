@@ -113,6 +113,62 @@ def live_instructions(agent: dict) -> str:
               " the call ends automatically after your goodbye.")
 
 
+# ---------------------------------------------------------------- cached greeting audio
+# The greeting is the same text every call. Gemini's spoken greeting from the first call is kept and
+# replayed the moment later calls connect, instead of waiting ~1.5 s for Gemini to connect and speak it.
+GREETING_DIR = os.environ.get("GREETING_CACHE_DIR", "/tmp/voiceos-greetings")
+_GREETINGS: dict[str, tuple[int, bytes]] = {}
+
+
+def greeting_key(agent: dict, model: str) -> str | None:
+    opening = (agent.get("opening") or "").strip()
+    if not opening:
+        return None
+    voice = agent.get("voice") if agent.get("voice") in LIVE_VOICES else DEFAULT_VOICE
+    raw = "|".join([model, voice, agent.get("language") or "English", opening])
+    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+def cached_greeting(k: str | None):
+    if not k:
+        return None
+    if k in _GREETINGS:
+        return _GREETINGS[k]
+    try:
+        for name in os.listdir(GREETING_DIR):
+            if name.startswith(k + "-"):
+                rate = int(name.rsplit("-", 1)[1].split(".")[0])
+                with open(os.path.join(GREETING_DIR, name), "rb") as f:
+                    _GREETINGS[k] = (rate, f.read())
+                return _GREETINGS[k]
+    except OSError:
+        pass
+    return None
+
+
+def store_greeting(k: str, rate: int, pcm: bytes):
+    seconds = len(pcm) / 2 / rate
+    if not (0.8 <= seconds <= 20):
+        return
+    _GREETINGS[k] = (rate, pcm)
+    try:
+        os.makedirs(GREETING_DIR, exist_ok=True)
+        with open(os.path.join(GREETING_DIR, f"{k}-{rate}.pcm"), "wb") as f:
+            f.write(pcm)
+    except OSError:
+        pass
+    logger.info(f"greeting audio cached ({seconds:.1f} s); next calls greet instantly")
+
+
+def already_greeted_agent(agent: dict) -> dict:
+    """Agent copy whose instructions say the greeting has already been played."""
+    opening = (agent.get("opening") or "").strip()
+    a = dict(agent)
+    a["instructions"] = (agent["instructions"] + f'\n\nThe call is already connected and you have just greeted the caller with:'
+                         f' "{opening}". Do not greet again; wait for the caller to answer, then continue.')
+    return a
+
+
 def opening_message(agent: dict) -> dict:
     opening = (agent.get("opening") or "").strip()
     language = agent.get("language") or "English"
@@ -122,7 +178,8 @@ def opening_message(agent: dict) -> dict:
     return {"role": "user", "content": text}
 
 
-def build_live_llm(*, key: str, model: str, agent: dict, tools_schema, phone: bool, thinking: bool = False):
+def build_live_llm(*, key: str, model: str, agent: dict, tools_schema, phone: bool, thinking: bool = False,
+                   speak_first: bool = True):
     from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, GeminiVADParams
     from google.genai.types import EndSensitivity, StartSensitivity
 
@@ -147,6 +204,7 @@ def build_live_llm(*, key: str, model: str, agent: dict, tools_schema, phone: bo
         ),
         **({"thinking": fast_thinking(model)} if thinking else {}),
     )
-    llm = GeminiLiveLLMService(api_key=key, settings=settings, tools=tools_schema)
+    llm = GeminiLiveLLMService(api_key=key, settings=settings, tools=tools_schema,
+                               inference_on_context_initialization=speak_first)
     logger.info(f"live engine: model={model} voice={voice} language={language} fast_thinking={thinking}")
     return llm
