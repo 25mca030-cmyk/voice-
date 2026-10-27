@@ -31,6 +31,7 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     InputAudioRawFrame,
+    InterimTranscriptionFrame,
     MetricsFrame,
     OutputAudioRawFrame,
     TranscriptionFrame,
@@ -146,10 +147,37 @@ def make_llm(spec: str, keys: dict):
 
 # Models the saved Google key answered for (see src/lib/model-catalog.ts). Tried in order when the chosen
 # model is overloaded (503), rate-limited (429), missing (404) or slow, so the caller always gets a reply.
-GEMINI_FALLBACKS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-3.6-flash", "gemini-3.5-flash"]
-FIRST_TOKEN_TIMEOUT = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT", "6"))
+# Measured first-token times on 26 Oct: 3.1-flash-lite 1.2-1.8 s, flash-lite-latest ~3.9 s,
+# 3.5-flash-lite 4-5.5 s; 3.6-flash and 3.5-flash timed out or answered 503. Phone calls need speed,
+# so the fastest models go first and the agent's own choice follows.
+FAST_MODELS = [m.strip() for m in os.environ.get(
+    "PHONE_FAST_MODELS", "gemini-3.1-flash-lite,gemini-flash-lite-latest,gemini-3.5-flash-lite").split(",") if m.strip()]
+GEMINI_FALLBACKS = ["gemini-3.5-flash", "gemini-3.6-flash"]
+FIRST_TOKEN_TIMEOUT = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT", "4"))
+# Whichever model answered last is tried first next time (shared across calls), so only the first turn
+# after an outage pays for the fallback search.
+_LAST_GOOD_MODEL: dict = {}
 
 from pipecat.services.google.llm import GoogleLLMService  # noqa: E402
+
+
+from google.genai.types import Content as _GContent  # noqa: E402
+from pipecat.processors.aggregators.llm_context import LLMSpecificMessage as _LLMSpecific  # noqa: E402
+from pipecat.services.google.llm import GoogleLLMContext as _GoogleLLMContext  # noqa: E402
+
+_orig_from_standard = _GoogleLLMContext.from_standard_message
+
+
+def _from_standard_message(self, message):
+    # Gemini 3 returns "thought signature" messages wrapped in LLMSpecificMessage. The legacy Google
+    # context crashed on them ('LLMSpecificMessage' object is not subscriptable), so the agent's own
+    # replies were not saved and later requests ended with a model turn (400).
+    if isinstance(message, _LLMSpecific):
+        return message.message if isinstance(message.message, _GContent) else None
+    return _orig_from_standard(self, message)
+
+
+_GoogleLLMContext.from_standard_message = _from_standard_message
 
 
 class FallbackGoogleLLM(GoogleLLMService):
@@ -167,7 +195,9 @@ class FallbackGoogleLLM(GoogleLLMService):
                     yield None
             return _empty()
         chosen = self._settings.model
-        models = [chosen] + [m for m in GEMINI_FALLBACKS if m != chosen]
+        preferred = _LAST_GOOD_MODEL.get(chosen)
+        models = ([preferred] if preferred else []) + FAST_MODELS + [chosen] + GEMINI_FALLBACKS
+        models = list(dict.fromkeys(models))
         last_error = None
         for model in models:
             self._settings.model = model
@@ -184,6 +214,7 @@ class FallbackGoogleLLM(GoogleLLMService):
                 self._settings.model = chosen
             if model != chosen:
                 logger.info(f"LLM answered with fallback model {model}")
+            _LAST_GOOD_MODEL[chosen] = model
 
             async def _chain(first=first, stream=stream):
                 if first is not None:
@@ -349,6 +380,31 @@ class OpeningGuard(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class ShortReplyFilter(FrameProcessor):
+    """Phone only: ignore 1-2 word fragments ("haan", "hmm", line noise) heard while the agent speaks.
+
+    Without barge-in each fragment queued its own LLM reply, so answers piled up and arrived late.
+    """
+
+    def __init__(self, min_words: int = 3):
+        super().__init__()
+        self._min_words = min_words
+        self._bot_speaking = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
+        elif (self._bot_speaking and direction == FrameDirection.DOWNSTREAM
+              and isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame))
+              and len(frame.text.split()) < self._min_words):
+            logger.debug(f"ignored short fragment while agent speaks: {frame.text!r}")
+            return
+        await self.push_frame(frame, direction)
+
+
 def add_turn(stats: dict, role: str, text: str):
     t = stats["transcript"]
     if t and t[-1]["role"] == role:
@@ -490,6 +546,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         *([OpeningGuard()] if phone and agent.get("opening") else []),
         Tracker(stats, "input", not phone),  # VAD, interruptions, latency
         stt,
+        *([ShortReplyFilter()] if phone else []),
         Tracker(stats, "stt", not phone),  # final transcriptions
         agg.user(),
         llm,
@@ -549,7 +606,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "llm-fallback-2026-10-26"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "fast-llm-keepalive-2026-10-27"}
 
 
 @app.websocket("/ws")
