@@ -58,6 +58,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.frames.frames import LLMRunFrame
 from audio_cleanup import make_noise_filter
+from call_recording import CallRecorder, save_recording
 from live_engine import (already_greeted_agent, build_live_llm, cached_greeting, forget_live_model, greeting_for_agent,
                          greeting_key, opening_message, pick_live_model, remember_agent_greeting, store_greeting,
                          thinking_supported, to_phone_rate)
@@ -379,6 +380,7 @@ class VobizSerializer(FrameSerializer):
         super().__init__()
         self.stream_id = stream_id
         self._on_close = on_close
+        self.recorder = CallRecorder()  # both sides, as sent/received, for the Recordings page
 
     @property
     def type(self):
@@ -386,6 +388,7 @@ class VobizSerializer(FrameSerializer):
 
     async def serialize(self, frame: Frame):
         if isinstance(frame, OutputAudioRawFrame):
+            self.recorder.add_bot(frame.audio, frame.sample_rate)
             payload = base64.b64encode(frame.audio).decode()
             return json.dumps({"event": "playAudio", "streamId": self.stream_id, "media": {"contentType": "audio/x-l16", "sampleRate": frame.sample_rate, "payload": payload}})
         if isinstance(frame, _Interrupt):
@@ -402,6 +405,7 @@ class VobizSerializer(FrameSerializer):
         # to VAD makes the agent interrupt itself (clearAudio) so the caller hears silence.
         if msg.get("event") == "media" and media.get("payload") and media.get("track", "inbound") == "inbound":
             pcm = base64.b64decode(media["payload"])
+            self.recorder.add_user(pcm)
             if PHONE_GAIN != 1.0 and pcm:
                 # Caller audio arrives quiet; a fixed boost (clipped) lets speech detection hear it reliably.
                 # Soft limiter instead of hard clipping: loud callers were distorted, which garbled what Gemini heard.
@@ -726,6 +730,11 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         finished.set()
         error = error or stats.get("error")
         lat = stats["latencies"]
+        if phone and os.environ.get("RECORDINGS") == "1":
+            try:
+                await save_recording(_bridge(), call_id, token, serializer.recorder.wav())
+            except Exception as e:  # a recording must never block saving the call
+                logger.warning(f"recording skipped: {type(e).__name__}")
         try:
             await voiceos("finish", {
                 **creds,
@@ -993,7 +1002,7 @@ async def _keep_awake():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "clear-turns-hangup-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "recordings-ready-2026-10-27"}
 
 
 @app.websocket("/ws")
