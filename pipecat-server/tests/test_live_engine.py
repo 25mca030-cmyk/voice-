@@ -114,6 +114,46 @@ class InstantGreeting(unittest.TestCase):
         self.assertIn("Do not greet again", live_engine.already_greeted_agent(AGENT)["instructions"])
 
 
+class PreSessionGreeting(unittest.TestCase):
+    def test_phone_greets_before_agent_loads(self):
+        import tempfile
+        aid = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as d, patch.object(live_engine, "GREETING_DIR", d):
+            live_engine._GREETINGS.clear()
+            k = live_engine.greeting_key(AGENT, "gemini-3.8-live")
+            live_engine.store_greeting(k, 24000, b"\x10\x00" * 24000)
+            live_engine.remember_agent_greeting(aid, k)
+            order = []
+
+            async def slow_voiceos(path, payload):
+                if path == "session":
+                    await asyncio.sleep(0.5)  # VoiceOS still loading the agent
+                    order.append("session")
+                    return {"agent": AGENT, "keys": {"gemini": "k"}}
+                return {}
+
+            async def fake_pick(key):
+                return "gemini-3.8-live"
+
+            async def ok(key, model):
+                return True
+
+            async def no_connect(self, *a, **kw):
+                return None
+            with patch.object(main, "voiceos", slow_voiceos), patch.object(main, "pick_live_model", fake_pick), \
+                    patch.object(main, "thinking_supported", ok), \
+                    patch("pipecat.services.google.gemini_live.llm.GeminiLiveLLMService._connect", no_connect):
+                from fastapi.testclient import TestClient
+                with TestClient(main.app).websocket_connect(f"/phone?call=c&token=t&agent={aid}") as ws:
+                    ws.send_text(json.dumps({"event": "start", "start": {"streamId": "S1"}}))
+                    first = json.loads(ws.receive_text())
+                    order.append(first.get("event"))
+                    ws.send_text(json.dumps({"event": "stop"}))
+            self.assertEqual(order[0], "playAudio")
+            self.assertEqual(first["streamId"], "S1")
+            self.assertEqual(first["media"]["sampleRate"], 16000)
+
+
 class BuildLive(unittest.TestCase):
     def test_settings(self):
         llm = live_engine.build_live_llm(key="k", model="gemini-3.8-live", agent=AGENT, tools_schema=None, phone=True)
