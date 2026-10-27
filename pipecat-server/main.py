@@ -41,6 +41,8 @@ from pipecat.frames.frames import (
     TTSTextFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -87,6 +89,7 @@ try:
     from pipecat.services.google.llm import GoogleLLMService as _GoogleLLM  # noqa: F401
     from pipecat.services.sarvam.stt import SarvamSTTService as _SarvamSTT  # noqa: F401
     import sarvam_flash as _sarvam_flash  # noqa: F401
+    import sarvam_live as _sarvam_live  # noqa: F401
     SileroVADAnalyzer()  # downloads/loads the VAD model now, not during a call
 except Exception as _e:  # pragma: no cover
     logger.warning(f"preload skipped: {_e}")
@@ -132,8 +135,8 @@ SARVAM_LANGS = {"Hindi": "hi-IN", "English": "en-IN", "Bengali": "bn-IN", "Gujar
 def make_stt(provider: str, language: str, keys: dict):
     code = LANG_CODES.get(language, "en")
     if provider == "sarvam":
-        from pipecat.services.sarvam.stt import SarvamSTTService
-        return SarvamSTTService(api_key=key(keys, "sarvam", "SARVAM_API_KEY"))
+        from sarvam_live import SafeSarvamSTT
+        return SafeSarvamSTT(api_key=key(keys, "sarvam", "SARVAM_API_KEY"))
     if provider == "openai":
         from pipecat.services.openai.stt import OpenAISTTService
         return OpenAISTTService(api_key=key(keys, "openai", "OPENAI_API_KEY"), model="gpt-4o-transcribe", language=code)
@@ -236,6 +239,7 @@ class FallbackGoogleLLM(GoogleLLMService):
         models = list(dict.fromkeys(models))
         last_error = None
         chosen_thinking = self._settings.thinking
+        t_start = time.time()
         for model in models:
             self._settings.model = model
             self._settings.thinking = thinking_for(model) or chosen_thinking
@@ -251,8 +255,7 @@ class FallbackGoogleLLM(GoogleLLMService):
             finally:
                 self._settings.model = chosen
                 self._settings.thinking = chosen_thinking
-            if model != chosen:
-                logger.info(f"LLM answered with fallback model {model}")
+            logger.info(f"LLM first token from {model} in {(time.time() - t_start) * 1000:.0f} ms")
             _LAST_GOOD_MODEL[chosen] = model
 
             async def _chain(first=first, stream=stream):
@@ -362,6 +365,7 @@ class Tracker(FrameProcessor):
                 s["user_stopped"] = time.time()
             elif isinstance(frame, BotStartedSpeakingFrame) and s.get("user_stopped"):
                 s["latencies"].append((time.time() - s.pop("user_stopped")) * 1000)
+                logger.info(f"turn latency {s['latencies'][-1]:.0f} ms (caller stopped -> agent audio)")
             elif isinstance(frame, _Interrupt):
                 s["interruptions"] += 1
         else:
@@ -414,7 +418,8 @@ class OpeningGuard(FrameProcessor):
                 self._done = True
                 logger.info("greeting finished; listening to caller")
             elif direction == FrameDirection.DOWNSTREAM and isinstance(
-                frame, (InputAudioRawFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame)):
+                frame, (InputAudioRawFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
+                        VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame)):
                 return  # drop caller audio/VAD while the greeting plays (no STT flush errors)
         await self.push_frame(frame, direction)
 
@@ -452,7 +457,7 @@ def add_turn(stats: dict, role: str, text: str):
         t.append({"role": role, "text": text})
 
 
-def build_services(agent: dict, keys: dict):
+def build_services(agent: dict, keys: dict, phone: bool = False):
     stt = make_stt(agent.get("stt", "deepgram"), agent.get("language", "English"), keys)
     llm = make_llm(agent.get("llm") or "google/gemini-3.5-flash", keys)
     if agent.get("tts") == "sarvam":
@@ -464,8 +469,15 @@ def build_services(agent: dict, keys: dict):
             chosen_language = agent.get("language", "Hindi").replace("English (India)", "English")
             if chosen_language not in persona_language:
                 raise ValueError(f"This Sarvam persona speaks {persona_language}; choose that language or a v3 voice")
-        # One versioned HTTPS adapter for v2/v3/v4: SDK WebSocket configs drift between releases.
-        tts = SarvamFlashTTSService(api_key=key(keys, "sarvam", "SARVAM_API_KEY"), voice_id=voice, language=lang)
+        tts = None
+        if os.environ.get("SARVAM_TTS_MODE", "stream") != "http":
+            # Streaming WebSocket for v3 speakers: first words in a few hundred ms, no gaps between sentences.
+            from sarvam_live import make_streaming_tts
+            tts = make_streaming_tts(api_key=key(keys, "sarvam", "SARVAM_API_KEY"), voice=voice, language=lang,
+                                     sample_rate=16000 if phone else 24000)
+        if tts is None:
+            # v4 personas / v2 voices (or SARVAM_TTS_MODE=http): versioned HTTPS adapter.
+            tts = SarvamFlashTTSService(api_key=key(keys, "sarvam", "SARVAM_API_KEY"), voice_id=voice, language=lang)
     else:
         tts = ElevenLabsTTSService(
             api_key=key(keys, "elevenlabs", "ELEVENLABS_API_KEY"),
@@ -542,7 +554,9 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
     )
 
     try:
-        stt, llm, tts = build_services(agent, keys)
+        stt, llm, tts = build_services(agent, keys, phone)
+        logger.info(f"call {call_id[:8]} services: stt={type(stt).__name__} llm={agent.get('llm')} "
+                    f"tts={type(tts).__name__} voice={agent.get('voice')} lang={agent.get('language')}")
     except Exception as e:
         # A setup failure must end the call visibly instead of leaving a silent open line.
         logger.exception("voice services failed to start")
@@ -647,7 +661,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "low-latency-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "live-stream-2026-10-27"}
 
 
 @app.websocket("/ws")
