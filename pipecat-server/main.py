@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 
 import httpx
@@ -192,7 +193,8 @@ FAST_MODELS = [m.strip() for m in os.environ.get(
     "PHONE_FAST_MODELS", "gemini-3.1-flash-lite,gemini-flash-lite-latest,gemini-3.5-flash-lite").split(",") if m.strip()]
 GEMINI_FALLBACKS = ["gemini-3.5-flash", "gemini-3.6-flash"]
 # With thinking at "minimal" the fast models answer well inside 3 s; a stuck model is skipped sooner.
-FIRST_TOKEN_TIMEOUT = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT", "3"))
+FIRST_TOKEN_TIMEOUT = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT", "3.5"))
+HEDGE_AFTER = float(os.environ.get("LLM_HEDGE_AFTER", "1.1"))
 # Whichever model answered last is tried first next time (shared across calls), so only the first turn
 # after an outage pays for the fallback search.
 _LAST_GOOD_MODEL: dict = {}
@@ -201,6 +203,7 @@ from pipecat.services.google.llm import GoogleLLMService  # noqa: E402
 
 
 from google.genai.types import Content as _GContent  # noqa: E402
+from google.genai.types import GenerateContentConfig  # noqa: E402
 from pipecat.processors.aggregators.llm_context import LLMSpecificMessage as _LLMSpecific  # noqa: E402
 from pipecat.services.google.llm import GoogleLLMContext as _GoogleLLMContext  # noqa: E402
 
@@ -220,10 +223,59 @@ _GoogleLLMContext.from_standard_message = _from_standard_message
 
 
 class FallbackGoogleLLM(GoogleLLMService):
-    """Gemini with per-model timeout and automatic fallback.
+    """Gemini with hedged requests, per-model timeout and automatic fallback.
 
     On 26 Oct gemini-3.5-flash hung 45 s and then answered 503 "high demand": the caller heard silence.
+    On 27 Oct gemini-3.1-flash-lite's first token took 1.0-2.9 s for the same short prompt. A second,
+    identical request after HEDGE_AFTER seconds cuts those slow tails: whichever answers first is used.
     """
+
+    def _config_for(self, params_from_context, model: str):
+        tools = params_from_context["tools"] or self._tools or []
+        gp = self._build_generation_params(
+            system_instruction=params_from_context["system_instruction"], tools=tools, tool_config=self._tool_config)
+        gp.pop("thinking_config", None)
+        thinking = thinking_for(model)
+        if thinking is not None:
+            gp["thinking_config"] = thinking.model_dump(exclude_unset=True)
+        return GenerateContentConfig(**gp)
+
+    async def _open(self, params_from_context, model: str):
+        # Model and config are passed explicitly, so parallel requests never share mutable settings.
+        stream = await self._client.aio.models.generate_content_stream(
+            model=model, contents=params_from_context["messages"], config=self._config_for(params_from_context, model))
+        try:
+            first = await stream.__anext__()
+        except StopAsyncIteration:
+            return None, None
+        return first, stream
+
+    async def _hedged(self, params_from_context, model: str):
+        tasks = [asyncio.create_task(self._open(params_from_context, model))]
+        deadline = time.monotonic() + FIRST_TOKEN_TIMEOUT
+        hedged = False
+        error = None
+        try:
+            while tasks:
+                wait = (HEDGE_AFTER if not hedged else deadline - time.monotonic())
+                done, _ = await asyncio.wait(tasks, timeout=max(0.0, min(wait, deadline - time.monotonic())),
+                                             return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    tasks.remove(t)
+                    if t.exception() is None:
+                        return t.result()
+                    error = t.exception()
+                if time.monotonic() >= deadline:
+                    raise asyncio.TimeoutError()
+                if not hedged and (not done or not tasks):
+                    hedged = True  # slow (or failed) first try: race a second identical request
+                    tasks.append(asyncio.create_task(self._open(params_from_context, model)))
+                elif not tasks:
+                    break
+            raise error or asyncio.TimeoutError()
+        finally:
+            for t in tasks:
+                t.cancel()
 
     async def _stream_content(self, params_from_context):
         messages = params_from_context["messages"]
@@ -238,23 +290,15 @@ class FallbackGoogleLLM(GoogleLLMService):
         models = ([preferred] if preferred else []) + FAST_MODELS + [chosen] + GEMINI_FALLBACKS
         models = list(dict.fromkeys(models))
         last_error = None
-        chosen_thinking = self._settings.thinking
         t_start = time.time()
+        await self.start_ttfb_metrics()
         for model in models:
-            self._settings.model = model
-            self._settings.thinking = thinking_for(model) or chosen_thinking
             try:
-                stream = await asyncio.wait_for(super()._stream_content(params_from_context), FIRST_TOKEN_TIMEOUT)
-                first = await asyncio.wait_for(stream.__anext__(), FIRST_TOKEN_TIMEOUT)
-            except StopAsyncIteration:
-                first, stream = None, None
+                first, stream = await self._hedged(params_from_context, model)
             except Exception as e:  # 503 / 429 / 404 / timeout -> next model
                 last_error = e
                 logger.warning(f"LLM {model} failed ({type(e).__name__}: {str(e)[:120]}); trying next model")
                 continue
-            finally:
-                self._settings.model = chosen
-                self._settings.thinking = chosen_thinking
             logger.info(f"LLM first token from {model} in {(time.time() - t_start) * 1000:.0f} ms")
             _LAST_GOOD_MODEL[chosen] = model
 
@@ -345,6 +389,18 @@ class VobizSerializer(FrameSerializer):
 
 
 # ---------------------------------------------------------------- call tracking
+# Caller farewells (English, Hindi, Hinglish, Gujarati). Matched on whole words of the final transcript.
+_BYE_WORDS = re.compile(
+    r"\b(bye|bye[- ]?bye|goodbye|good bye|ta[- ]?ta|alvida|अलविदा|बाय|टाटा|आवजो|avjo|aavjo)\b"
+    r"|\b(ok|okay|chalo|theek hai|thank you|thanks)\W+(bye|bye[- ]?bye)\b"
+    r"|\b(phone|call)\s+(rakh|rakhta|rakhti|kaat|cut)", re.IGNORECASE)
+_AGENT_BYE = re.compile(r"\b(goodbye|good bye|bye|alvida|अलविदा|have a (great|good|nice) day)\b", re.IGNORECASE)
+
+
+def is_farewell(text: str) -> bool:
+    return bool(_BYE_WORDS.search(text or ""))
+
+
 class Tracker(FrameProcessor):
     """Collects transcript, interruptions, latency and token usage; mirrors transcript to the browser."""
 
@@ -358,19 +414,33 @@ class Tracker(FrameProcessor):
         if self.role == "stt":
             if isinstance(frame, TranscriptionFrame) and frame.text.strip():
                 add_turn(s, "user", frame.text.strip() + " ")
+                if is_farewell(frame.text):
+                    s["caller_bye"] = True
+                    s["bye_reply_started"] = False
+                    logger.info(f"caller said goodbye ({frame.text.strip()[:40]!r}); agent will say goodbye and hang up")
                 if self.ui:
                     await self.push_frame(TransportMessageUrgentFrame(message={"type": "session.input_transcript.delta", "delta": frame.text.strip() + " "}))
         elif self.role == "input":
             if isinstance(frame, UserStoppedSpeakingFrame):
                 s["user_stopped"] = time.time()
-            elif isinstance(frame, BotStartedSpeakingFrame) and s.get("user_stopped"):
-                s["latencies"].append((time.time() - s.pop("user_stopped")) * 1000)
-                logger.info(f"turn latency {s['latencies'][-1]:.0f} ms (caller stopped -> agent audio)")
+            elif isinstance(frame, BotStartedSpeakingFrame):
+                if s.get("caller_bye") or s.get("agent_bye"):
+                    s["bye_reply_started"] = True
+                if s.get("user_stopped"):
+                    s["latencies"].append((time.time() - s.pop("user_stopped")) * 1000)
+                    logger.info(f"turn latency {s['latencies'][-1]:.0f} ms (caller stopped -> agent audio)")
+            elif isinstance(frame, BotStoppedSpeakingFrame):
+                # The goodbye has finished playing: end the call from our side.
+                if s.get("hangup") and (s.get("agent_bye") or (s.get("caller_bye") and s.get("bye_reply_started"))):
+                    s["bye_reply_started"] = False
+                    s["hangup"]()
             elif isinstance(frame, _Interrupt):
                 s["interruptions"] += 1
         else:
             if isinstance(frame, TTSTextFrame) and frame.text:
                 add_turn(s, "assistant", frame.text + " ")
+                if s.get("caller_bye") is None and _AGENT_BYE.search(frame.text) and len(s["transcript"]) > 2:
+                    s["agent_bye"] = True  # the agent closed the conversation itself
                 if self.ui:
                     await self.push_frame(TransportMessageUrgentFrame(message={"type": "session.output_transcript.delta", "delta": frame.text + " "}))
             elif isinstance(frame, MetricsFrame) and LLMUsageMetricsData:
@@ -443,7 +513,7 @@ class ShortReplyFilter(FrameProcessor):
             self._bot_speaking = False
         elif (self._bot_speaking and direction == FrameDirection.DOWNSTREAM
               and isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame))
-              and len(frame.text.split()) < self._min_words):
+              and len(frame.text.split()) < self._min_words and not is_farewell(frame.text)):
             logger.debug(f"ignored short fragment while agent speaks: {frame.text!r}")
             return
         await self.push_frame(frame, direction)
@@ -488,9 +558,11 @@ def build_services(agent: dict, keys: dict, phone: bool = False):
 
 
 # ---------------------------------------------------------------- call runner
-async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_id: str = ""):
+async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_id: str = "", session_task=None):
+    t_open = time.time()
     try:
-        session = await voiceos("session", {"call_id": call_id, "token": token})
+        session = await (session_task or voiceos("session", {"call_id": call_id, "token": token}))
+        logger.info(f"call {call_id[:8]} agent loaded from VoiceOS in {(time.time() - t_open) * 1000:.0f} ms")
     except Exception as e:
         logger.warning(f"session rejected: {e}")
         if not phone:
@@ -504,6 +576,25 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
     started = time.time()
     finished = asyncio.Event()
     task_ref: dict = {}
+
+    def hangup():
+        """Farewell: let the last audio reach the caller, then close the stream (Vobiz ends the call)."""
+        if "reason" in stats:
+            return
+        stats["reason"] = "farewell"
+
+        async def _end():
+            await asyncio.sleep(0.8)
+            logger.info(f"call {call_id[:8]} ending after farewell")
+            await finish()
+            await asyncio.sleep(0.5)
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        asyncio.get_event_loop().create_task(_end())
+
+    stats["hangup"] = hangup
 
     def on_close(reason: str):
         if "reason" not in stats:
@@ -547,7 +638,9 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             audio_out_10ms_chunks=4,
             # stop_secs is the silence the agent waits for before it answers: 0.8 s added a noticeable pause
             # to every turn. Phone keeps higher confidence/volume so line noise still isn't speech.
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.75, start_secs=0.3, stop_secs=0.45, min_volume=0.6))
+            # Phone audio from Vobiz is quiet: min_volume 0.6 missed most real speech, so turns only ended when
+            # Sarvam's own endpointing fired (+0.5 s emulation). 0.3 still ignores line hiss.
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.65, start_secs=0.25, stop_secs=0.4, min_volume=0.3))
             if phone else SileroVADAnalyzer(params=VADParams(confidence=0.7, start_secs=0.2, stop_secs=0.4, min_volume=0.6)),
             serializer=serializer,
         ),
@@ -590,7 +683,10 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
     context = OpenAILLMContext(
         messages=[{"role": "system", "content": agent["instructions"]
-                   + "\n\nThis is a live voice call: reply in 1-2 short spoken sentences unless asked for detail."}],
+                   + "\n\nThis is a live voice call: reply in 1-2 short spoken sentences unless asked for detail."
+                   + "\nWhen the caller says bye or wants to end the call, reply only with a short polite goodbye"
+                     " (for example \"Thank you for your time. Goodbye!\") in their language and ask nothing more;"
+                     " the call ends automatically after your goodbye."}],
         tools=ToolsSchema(standard_tools=schemas) if schemas else None,
     )
     agg = llm.create_context_aggregator(context)
@@ -661,7 +757,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "live-stream-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "fast-turns-hangup-2026-10-27"}
 
 
 @app.websocket("/ws")
@@ -675,6 +771,8 @@ async def phone_ws(ws: WebSocket):
     await ws.accept()
     call_id = ws.query_params.get("call", "")
     logger.info(f"phone stream opened for call {call_id[:8]}")
+    # Load the agent while Vobiz is still sending its start event.
+    session_task = asyncio.create_task(voiceos("session", {"call_id": call_id, "token": ws.query_params.get("token", "")}))
     stream_id = ""
     # Vobiz sends a "start" event first (text or binary JSON); never crash or hang before the call starts.
     try:
@@ -698,6 +796,7 @@ async def phone_ws(ws: WebSocket):
         logger.exception(f"phone stream failed before start: {e}")
         return
     try:
-        await run_call(ws, call_id, ws.query_params.get("token", ""), phone=True, stream_id=stream_id)
+        await run_call(ws, call_id, ws.query_params.get("token", ""), phone=True, stream_id=stream_id,
+                       session_task=session_task)
     except Exception as e:
         logger.exception(f"phone call failed: {e}")
