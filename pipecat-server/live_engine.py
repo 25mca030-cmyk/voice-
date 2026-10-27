@@ -39,12 +39,29 @@ def _hash(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
-async def _handshake(key: str, model: str, timeout: float) -> bool:
+def fast_thinking(model: str):
+    """Lowest thinking each live model accepts: Gemini 3 thinks before speaking unless told not to."""
+    from google.genai.types import ThinkingConfig
+    if "gemini-3" in model:
+        return ThinkingConfig(thinking_level="MINIMAL")
+    if "2.5" in model:
+        return ThinkingConfig(thinking_budget=0)
+    return None
+
+
+_THINKING_OK: dict[str, bool] = {}  # model -> Google accepted the fast-thinking setting
+
+
+async def _handshake(key: str, model: str, timeout: float, thinking=None) -> bool:
     from google import genai
     client = genai.Client(api_key=key)
     try:
+        config = {"response_modalities": ["AUDIO"]}
+        if thinking is not None:
+            config["thinking_config"] = thinking
+
         async def _try():
-            async with client.aio.live.connect(model=model, config={"response_modalities": ["AUDIO"]}):
+            async with client.aio.live.connect(model=model, config=config):
                 return True
         return await asyncio.wait_for(_try(), timeout)
     except Exception as e:
@@ -72,6 +89,15 @@ async def pick_live_model(key: str) -> str | None:
     return None
 
 
+async def thinking_supported(key: str, model: str) -> bool:
+    """Checked once per model (about 0.5 s, run while the call is being set up), then cached."""
+    if model not in _THINKING_OK:
+        cfg = fast_thinking(model)
+        _THINKING_OK[model] = bool(cfg) and await _handshake(key, model, 3, cfg)
+        logger.info(f"fast thinking for {model}: {'on' if _THINKING_OK[model] else 'off'}")
+    return _THINKING_OK[model]
+
+
 def forget_live_model(key: str):
     h = _hash(key)
     _GOOD.pop(h, None)
@@ -95,7 +121,7 @@ def opening_message(agent: dict) -> dict:
     return {"role": "user", "content": text}
 
 
-def build_live_llm(*, key: str, model: str, agent: dict, tools_schema, phone: bool):
+def build_live_llm(*, key: str, model: str, agent: dict, tools_schema, phone: bool, thinking: bool = False):
     from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, GeminiVADParams
     from google.genai.types import EndSensitivity, StartSensitivity
 
@@ -115,7 +141,8 @@ def build_live_llm(*, key: str, model: str, agent: dict, tools_schema, phone: bo
             silence_duration_ms=SILENCE_MS,
             prefix_padding_ms=100,
         ),
+        **({"thinking": fast_thinking(model)} if thinking else {}),
     )
     llm = GeminiLiveLLMService(api_key=key, settings=settings, tools=tools_schema)
-    logger.info(f"live engine: model={model} voice={voice} language={language}")
+    logger.info(f"live engine: model={model} voice={voice} language={language} fast_thinking={thinking}")
     return llm

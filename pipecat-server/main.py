@@ -20,6 +20,7 @@ import re
 import time
 
 import httpx
+import numpy as np
 from fastapi import FastAPI, WebSocket
 from loguru import logger
 
@@ -52,7 +53,7 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.frames.frames import LLMRunFrame
-from live_engine import build_live_llm, forget_live_model, opening_message, pick_live_model
+from live_engine import build_live_llm, forget_live_model, opening_message, pick_live_model, thinking_supported
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.serializers.base_serializer import FrameSerializer
 try:
@@ -85,6 +86,11 @@ LANG_CODES = {
     "Spanish": "es", "French": "fr", "German": "de", "Portuguese": "pt", "Italian": "it", "Japanese": "ja",
     "Arabic": "ar", "Chinese": "zh",
 }
+
+# DEBUG logging wrote a line for many audio events; on a 0.15-CPU server that competes with the audio.
+import sys  # noqa: E402
+logger.remove()
+logger.add(sys.stderr, level=os.environ.get("LOG_LEVEL", "INFO"))
 
 app = FastAPI(title="VoiceOS Pipecat")
 
@@ -428,12 +434,17 @@ class Tracker(FrameProcessor):
             if isinstance(frame, VADUserStoppedSpeakingFrame):
                 s["user_stopped"] = time.time() - s.get("vad_stop_secs", 0)  # moment speech actually ended
             elif isinstance(frame, BotStartedSpeakingFrame):
+                lv = s.get("last_voice")
+                if lv and lv > s.get("bot_stopped_at", 0) and not s.get("user_stopped"):
+                    s["latencies"].append((time.time() - lv) * 1000)
+                    logger.info(f"turn latency {s['latencies'][-1]:.0f} ms (caller's last sound -> agent audio sent)")
                 if s.get("caller_bye") or s.get("agent_bye"):
                     s["bye_reply_started"] = True
                 if s.get("user_stopped"):
                     s["latencies"].append((time.time() - s.pop("user_stopped")) * 1000)
                     logger.info(f"turn latency {s['latencies'][-1]:.0f} ms (caller stopped -> agent audio)")
             elif isinstance(frame, BotStoppedSpeakingFrame):
+                s["bot_stopped_at"] = time.time()
                 # The goodbye has finished playing: end the call from our side.
                 if s.get("hangup") and (s.get("agent_bye") or (s.get("caller_bye") and s.get("bye_reply_started"))):
                     s["bye_reply_started"] = False
@@ -452,6 +463,22 @@ class Tracker(FrameProcessor):
                     if isinstance(d, LLMUsageMetricsData):
                         s["input_tokens"] += d.value.prompt_tokens or 0
                         s["output_tokens"] += d.value.completion_tokens or 0
+        await self.push_frame(frame, direction)
+
+
+class VoiceClock(FrameProcessor):
+    """Live engine: notes when the caller last made sound, to time each reply (cheap RMS, no model)."""
+
+    def __init__(self, stats: dict, threshold: int = 600):
+        super().__init__()
+        self.stats, self.threshold = stats, threshold
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame) and frame.audio:
+            samples = np.frombuffer(frame.audio, dtype=np.int16)
+            if samples.size and float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))) > self.threshold:
+                self.stats["last_voice"] = time.time()
         await self.push_frame(frame, direction)
 
 
@@ -651,6 +678,16 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
                 await task.queue_frame(TransportMessageUrgentFrame(message={"type": "session.closed"}))
             await task.queue_frame(EndFrame())
 
+    # Gemini Live (one model hears and speaks) is the default; the three-step pipeline is the fallback.
+    live_model = None
+    gemini_key = key(keys, "gemini", "GEMINI_API_KEY")
+    if os.environ.get("VOICE_ENGINE", "live") == "live":
+        try:
+            live_model = await pick_live_model(gemini_key)
+        except Exception:
+            logger.exception("live model check failed; using the three-step pipeline")
+    thinking_task = asyncio.create_task(thinking_supported(gemini_key, live_model)) if live_model else None
+
     serializer = VobizSerializer(stream_id, on_close) if phone else BrowserSerializer(on_close)
     transport = FastAPIWebsocketTransport(
         websocket=ws,
@@ -663,20 +700,15 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             # to every turn. Phone keeps higher confidence/volume so line noise still isn't speech.
             # Phone audio from Vobiz is quiet: min_volume 0.6 missed most real speech, so turns only ended when
             # Sarvam's own endpointing fired (+0.5 s emulation). 0.3 still ignores line hiss.
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.65, start_secs=0.25, stop_secs=0.4, min_volume=0.3))
-            if phone else SileroVADAnalyzer(params=VADParams(confidence=0.7, start_secs=0.2, stop_secs=0.4, min_volume=0.6)),
+            # Gemini Live detects speech itself; skipping the local detector frees CPU on the small server,
+            # which was near its limit (0.12 of 0.15 CPU) and made the voice break up.
+            vad_analyzer=None if live_model else (
+                SileroVADAnalyzer(params=VADParams(confidence=0.65, start_secs=0.25, stop_secs=0.4, min_volume=0.3))
+                if phone else SileroVADAnalyzer(params=VADParams(confidence=0.7, start_secs=0.2, stop_secs=0.4, min_volume=0.6))),
             serializer=serializer,
         ),
     )
 
-    # Gemini Live (one model hears and speaks) is the default; the three-step pipeline is the fallback.
-    live_model = None
-    gemini_key = key(keys, "gemini", "GEMINI_API_KEY")
-    if os.environ.get("VOICE_ENGINE", "live") == "live":
-        try:
-            live_model = await pick_live_model(gemini_key)
-        except Exception:
-            logger.exception("live model check failed; using the three-step pipeline")
 
     schemas = []
     handlers = {}
@@ -703,7 +735,12 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
     try:
         if live_model:
             stt = tts = None
-            llm = build_live_llm(key=gemini_key, model=live_model, agent=agent, tools_schema=tools_schema, phone=phone)
+            try:
+                fast = await asyncio.wait_for(thinking_task, 3.5)
+            except Exception:
+                fast = False
+            llm = build_live_llm(key=gemini_key, model=live_model, agent=agent, tools_schema=tools_schema,
+                                 phone=phone, thinking=fast)
             logger.info(f"call {call_id[:8]} engine: gemini live ({live_model})")
         else:
             stt, llm, tts = build_services(agent, keys, phone)
@@ -731,6 +768,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             CallErrors(stats),
             LiveErrors(gemini_key),
             *([OpeningGuard()] if phone and agent.get("opening") else []),
+            VoiceClock(stats),
             Tracker(stats, "input", not phone),  # VAD, latency, goodbye hang-up
             Tracker(stats, "stt", not phone),  # caller transcript (sent upstream by Gemini Live)
             live_user,
@@ -821,7 +859,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "low-latency-live-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "fast-live-2026-10-27"}
 
 
 @app.websocket("/ws")
