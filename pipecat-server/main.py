@@ -963,9 +963,30 @@ async def play_instant_greeting(ws: WebSocket, stream_id: str, agent_id: str, op
     return time.time() + len(pcm16) / 2 / 16000
 
 
+@app.on_event("startup")
+async def _keep_awake():
+    """Render's free plan puts the server to sleep after 15 idle minutes; waking takes ~70 s, so Vobiz
+    gave up and the call hung up (27 Oct, 16:33 and 16:34 IST). With KEEP_AWAKE=1 the server pings its
+    own public address every 10 minutes so it never sleeps. Set it on one service only: Render's free
+    hours (750/month) cover a single always-on service."""
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if os.environ.get("KEEP_AWAKE") != "1" or not url:
+        return
+
+    async def loop():
+        while True:
+            await asyncio.sleep(int(os.environ.get("KEEP_AWAKE_SECS", "600")))
+            try:
+                await _bridge().get(f"{url}/health", timeout=30)
+            except Exception as e:
+                logger.warning(f"keep-awake ping failed: {e}")
+    asyncio.get_event_loop().create_task(loop())
+    logger.info(f"keep-awake on: pinging {url}/health every 10 minutes")
+
+
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "noise-language-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "always-awake-2026-10-27"}
 
 
 @app.websocket("/ws")
