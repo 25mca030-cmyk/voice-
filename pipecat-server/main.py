@@ -773,7 +773,9 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            audio_out_10ms_chunks=2,  # 20 ms packets: less buffering before the caller hears audio
+            # 40 ms packets: half the per-packet work of 20 ms. On the free 0.15-CPU server the call hit the
+            # CPU limit (28 Oct, 10:08 IST) and the agent's voice broke up; 40 ms is within Vobiz's 20-60 ms range.
+            audio_out_10ms_chunks=4,
             # stop_secs is the silence the agent waits for before it answers: 0.8 s added a noticeable pause
             # to every turn. Phone keeps higher confidence/volume so line noise still isn't speech.
             # Phone audio from Vobiz is quiet: min_volume 0.6 missed most real speech, so turns only ended when
@@ -1017,7 +1019,7 @@ async def _keep_awake():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "pickup-greeting-2026-10-28"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "lighter-audio-2026-10-28"}
 
 
 @app.websocket("/ws")
