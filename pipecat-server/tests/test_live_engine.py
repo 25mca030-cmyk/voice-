@@ -200,3 +200,28 @@ class LiveCallStarts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentLookup(unittest.TestCase):
+    def test_lookup_returns_agent_or_empty(self):
+        class Resp:
+            def __init__(self, code, body):
+                self.status_code, self._b = code, body
+
+            def json(self):
+                return self._b
+
+        class Client:
+            def __init__(self, resp):
+                self.resp = resp
+
+            async def post(self, url, **kw):
+                assert url.endswith("/rest/v1/rpc/pipecat_call_agent")
+                return self.resp
+        env = {"SUPABASE_URL": "https://x.supabase.co", "SUPABASE_PUBLISHABLE_KEY": "k"}
+        cid = "11111111-2222-3333-4444-555555555555"
+        with patch.dict(os.environ, env):
+            with patch.object(main, "_bridge", lambda: Client(Resp(200, cid))):
+                self.assertEqual(asyncio.run(main.lookup_call_agent(cid, "t")), cid)
+            with patch.object(main, "_bridge", lambda: Client(Resp(404, {"message": "no function"}))):
+                self.assertEqual(asyncio.run(main.lookup_call_agent(cid, "t")), "")
