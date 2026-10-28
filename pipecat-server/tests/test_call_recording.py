@@ -38,6 +38,17 @@ class Recorder(unittest.TestCase):
         caller_peak, agent_peak = np.abs(x[:32000]).max(), np.abs(x[32000:]).max()
         self.assertGreater(caller_peak, agent_peak * 0.6)
 
+    def test_turn_gaps(self):
+        r = call_recording.CallRecorder()
+        speech = (np.sin(2 * np.pi * 300 * np.arange(320) / 16000) * 2000).astype(np.int16).tobytes()
+        silence = b"\x00\x00" * 320
+        for i in range(100):  # caller talks for 1 s, then 1 s of silence
+            r.add_user(speech if i < 50 else silence)
+        r._bot = [(r._t0 + 1.8, b"\x01\x00" * 16000)]  # agent starts 0.8 s after the caller stopped
+        gaps = r.turn_gaps()
+        self.assertEqual(len(gaps), 1)
+        self.assertAlmostEqual(gaps[0], 0.8, delta=0.1)
+
     def test_too_short_is_skipped(self):
         r = call_recording.CallRecorder()
         r.add_user(b"\x00\x00" * 100)
