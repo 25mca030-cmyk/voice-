@@ -118,6 +118,9 @@ except Exception as _e:  # pragma: no cover
 
 
 # ---------------------------------------------------------------- VoiceOS bridge (signed)
+# Agent setup VoiceOS returned for each agent's last call (memory only; refreshed on every call).
+_SESSION_CACHE: dict[str, dict] = {}
+
 # One keep-alive client for every VoiceOS callback: a new client per request paid a fresh TLS
 # handshake (~150-300 ms) on session start and on every tool call.
 _BRIDGE: httpx.AsyncClient | None = None
@@ -543,6 +546,61 @@ class GreetingPlayer(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class BargeInGuard(FrameProcessor):
+    """While the agent talks, only sustained caller speech reaches Gemini.
+
+    Line noise, "hmm" and background voices made Gemini cut the agent off 10 times in one 85 s call
+    (28 Oct) - that was the "breaking" voice. Short sounds during the agent's speech are replaced with
+    silence; speech that stays loud for BARGE_MS is a real interruption and is passed on in full."""
+
+    def __init__(self, barge_ms: int = 350):
+        super().__init__()
+        self._barge_ms = barge_ms
+        self._bot = False
+        self._loud_ms = 0.0
+        self._quiet_ms = 0.0
+        self._open = False
+        self._held: list = []
+        self._floor = 300.0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot, self._open, self._loud_ms, self._held = True, False, 0.0, []
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot = False
+            for held in self._held:  # anything held back is still the caller's speech
+                await self.push_frame(held, FrameDirection.DOWNSTREAM)
+            self._held = []
+        elif isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM and self._bot:
+            samples = np.frombuffer(frame.audio, dtype=np.int16)
+            rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))) if samples.size else 0.0
+            ms = 1000 * samples.size / max(1, frame.sample_rate)
+            threshold = max(900.0, self._floor * 3)
+            if rms > threshold:
+                self._loud_ms += ms
+                self._quiet_ms = 0.0
+            else:
+                self._floor = 0.95 * self._floor + 0.05 * rms
+                self._quiet_ms += ms
+                if self._quiet_ms > 250:
+                    self._loud_ms = 0.0
+            if self._open or self._loud_ms >= self._barge_ms:
+                if not self._open:
+                    self._open = True
+                    for held in self._held:  # let Gemini hear the start of the interruption
+                        await self.push_frame(held, FrameDirection.DOWNSTREAM)
+                    self._held = []
+                return await self.push_frame(frame, direction)
+            if self._loud_ms > 0:
+                self._held.append(frame)
+                self._held = self._held[-20:]
+            silent = InputAudioRawFrame(audio=b"\x00" * len(frame.audio), sample_rate=frame.sample_rate,
+                                        num_channels=frame.num_channels)
+            return await self.push_frame(silent, direction)
+        await self.push_frame(frame, direction)
+
+
 class VoiceClock(FrameProcessor):
     """Live engine: notes when the caller last made sound, to time each reply (cheap RMS, no model)."""
 
@@ -688,9 +746,19 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
                    stream_opened_at: float | None = None, agent_id: str = "", pre_greeted_until: float = 0.0):
     t_open = time.time()
     t_stream = stream_opened_at or t_open
+    session_task = session_task or asyncio.ensure_future(voiceos("session", {"call_id": call_id, "token": token}))
+    cached = _SESSION_CACHE.get(agent_id) if agent_id else None
     try:
-        session = await (session_task or voiceos("session", {"call_id": call_id, "token": token}))
-        logger.info(f"call {call_id[:8]} agent loaded from VoiceOS in {(time.time() - t_open) * 1000:.0f} ms")
+        if cached and not session_task.done():
+            # The database already confirmed (with this call's secret) that the call belongs to this agent, and
+            # VoiceOS loaded this agent before: start now with that copy; VoiceOS still claims the call meanwhile.
+            session = cached
+            logger.info(f"call {call_id[:8]} started from the saved agent (VoiceOS still loading in the background)")
+        else:
+            session = await session_task
+            logger.info(f"call {call_id[:8]} agent loaded from VoiceOS in {(time.time() - t_open) * 1000:.0f} ms")
+            if agent_id:
+                _SESSION_CACHE[agent_id] = session
     except Exception as e:
         logger.warning(f"session rejected: {e}")
         if not phone:
@@ -726,6 +794,24 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
     stats["hangup"] = hangup
 
+    async def _confirm_session():
+        """Started from the saved agent: VoiceOS must still accept the call, or the call ends."""
+        try:
+            fresh = await session_task
+            if agent_id:
+                _SESSION_CACHE[agent_id] = fresh
+            logger.info(f"call {call_id[:8]} confirmed by VoiceOS {(time.time() - t_open) * 1000:.0f} ms after start")
+        except Exception as e:
+            logger.warning(f"call {call_id[:8]} rejected by VoiceOS: {e}")
+            stats.setdefault("reason", "rejected")
+            await finish("Call was not accepted by VoiceOS")
+            try:
+                await ws.close()
+            except Exception:
+                pass
+    if session is cached and cached is not None:
+        asyncio.get_event_loop().create_task(_confirm_session())
+
     def on_close(reason: str):
         if "reason" not in stats:
             stats["reason"] = reason
@@ -737,6 +823,10 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         finished.set()
         error = error or stats.get("error")
         lat = stats["latencies"]
+        try:  # the call must be claimed by VoiceOS before it can be saved
+            await asyncio.wait_for(asyncio.shield(session_task), 15)
+        except Exception:
+            pass
         if phone and os.environ.get("RECORDINGS") == "1":
             try:
                 await save_recording(_bridge(), call_id, token, serializer.recorder.wav())
@@ -872,6 +962,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             *([OpeningGuard(max_secs=max(0.0, pre_greeted_until - time.time()) if pre_greeted else 12.0)]
               if phone and agent.get("opening") else []),
             VoiceClock(stats),
+            *([BargeInGuard()] if phone else []),
             Tracker(stats, "input", not phone),  # VAD, latency, goodbye hang-up
             live_user,
             # Caller transcript: Gemini Live sends it upstream and the user aggregator swallows it, so this
@@ -1026,7 +1117,7 @@ async def _keep_awake():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "pickup-greeting-light-2026-10-28"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "steady-voice-2026-10-28"}
 
 
 @app.websocket("/ws")
