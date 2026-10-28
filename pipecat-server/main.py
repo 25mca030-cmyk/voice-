@@ -667,7 +667,7 @@ class BargeInGuard(FrameProcessor):
     def __init__(self, barge_ms: int = 350, clock=None):
         super().__init__()
         self._barge_ms = barge_ms
-        self._clock = clock  # VobizSerializer: knows when the caller really stops hearing the agent
+        self._playout = clock  # VobizSerializer: knows when the caller really stops hearing the agent
         self._bot = False
         self.opened = 0
         self._loud_ms = 0.0
@@ -677,10 +677,13 @@ class BargeInGuard(FrameProcessor):
         self._floor = 300.0
 
     def _bot_audible(self) -> bool:
-        if self._clock is not None:
+        if self._playout is not None:
             # The agent's own voice echoes back on the line until it has finished playing on the phone,
             # which is up to half a reply after Pipecat says it stopped: guard until then.
-            return self._bot or self._clock.playing()
+            try:
+                return self._bot or bool(self._playout.playing())
+            except Exception:
+                return self._bot
         return self._bot
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -689,7 +692,7 @@ class BargeInGuard(FrameProcessor):
             self._bot, self._open, self._loud_ms, self._held = True, False, 0.0, []
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot = False
-            if self._clock is None:
+            if self._playout is None:
                 for held in self._held:  # anything held back is still the caller's speech
                     await self.push_frame(held, FrameDirection.DOWNSTREAM)
                 self._held = []
