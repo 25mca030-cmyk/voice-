@@ -88,7 +88,7 @@ if __name__ == "__main__":
 
 
 class LivePathFarewell(unittest.IsolatedAsyncioTestCase):
-    async def test_agent_goodbye_after_greeting_hangs_up(self):
+    async def test_agent_goodbye_alone_does_not_hang_up(self):
         calls = []
         stats = {"transcript": [], "latencies": [], "hangup": lambda: calls.append(1)}
         inp, asst = main.Tracker(stats, "input", False), main.Tracker(stats, "assistant", False)
@@ -103,7 +103,7 @@ class LivePathFarewell(unittest.IsolatedAsyncioTestCase):
         await inp.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
         await asst.process_frame(TTSTextFrame("Thank you for your time. Goodbye!", aggregated_by="sentence"), FrameDirection.DOWNSTREAM)
         await inp.process_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
-        self.assertEqual(calls, [1])
+        self.assertEqual(calls, [])  # only the caller's "bye" ends the call
 
 
 class LivePipelineOrder(unittest.TestCase):
