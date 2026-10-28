@@ -461,7 +461,7 @@ class Tracker(FrameProcessor):
                 if lv and lv > s.get("bot_stopped_at", 0) and not s.get("user_stopped"):
                     s["latencies"].append((time.time() - lv) * 1000)
                     logger.info(f"turn latency {s['latencies'][-1]:.0f} ms (caller's last sound -> agent audio sent)")
-                if s.get("caller_bye") or s.get("agent_bye"):
+                if s.get("caller_bye"):
                     s["bye_reply_started"] = True
                 if s.get("user_stopped"):
                     s["latencies"].append((time.time() - s.pop("user_stopped")) * 1000)
@@ -472,7 +472,7 @@ class Tracker(FrameProcessor):
                     s["greeting_done"] = True
                     return await self.push_frame(frame, direction)
                 # The goodbye has finished playing: end the call from our side.
-                if s.get("hangup") and (s.get("agent_bye") or (s.get("caller_bye") and s.get("bye_reply_started"))):
+                if s.get("hangup") and s.get("caller_bye") and s.get("bye_reply_started"):
                     s["bye_reply_started"] = False
                     s["hangup"]()
             elif isinstance(frame, _Interrupt):
@@ -480,8 +480,8 @@ class Tracker(FrameProcessor):
         else:
             if isinstance(frame, TTSTextFrame) and frame.text:
                 add_turn(s, "assistant", frame.text + " ")
-                if s.get("greeting_done") and _AGENT_BYE.search(frame.text):
-                    s["agent_bye"] = True  # the agent closed the conversation itself
+                # The agent saying "goodbye" must NOT end the call (28 Oct: it hung up on callers mid-conversation).
+                # Only the caller saying bye ends it (see caller_bye).
                 if self.ui:
                     await self.push_frame(TransportMessageUrgentFrame(message={"type": "session.output_transcript.delta", "delta": frame.text + " "}))
             elif isinstance(frame, MetricsFrame) and LLMUsageMetricsData:
@@ -1019,7 +1019,7 @@ async def _keep_awake():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "lighter-audio-2026-10-28"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "caller-bye-only-2026-10-28"}
 
 
 @app.websocket("/ws")

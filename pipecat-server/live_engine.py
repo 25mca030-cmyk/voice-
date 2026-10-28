@@ -115,6 +115,8 @@ def live_instructions(agent: dict) -> str:
             + "\nAlways reply in the language the caller is speaking (Hindi, English, Hinglish, Gujarati, Marathi, Tamil"
               " or another Indian language) and switch when they switch. If you could not hear the caller clearly"
               " because of background noise, briefly ask them to repeat instead of guessing."
+            + "\nNever end the conversation or say goodbye on your own, even if the caller is not interested:"
+              " keep helping or ask if there is anything else. Only the caller ends the call."
             + "\nWhen the caller says bye or wants to end the call, reply only with a short polite goodbye"
               " (for example \"Thank you for your time. Goodbye!\") in their language and ask nothing more;"
               " the call ends automatically after your goodbye.")
