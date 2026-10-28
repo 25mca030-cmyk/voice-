@@ -562,6 +562,20 @@ class GreetingPlayer(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+def live_aggregators(context):
+    """Context aggregators for Gemini Live calls, with turn-taking left to Gemini.
+
+    Pipecat's default treats any caller transcript as "the caller started talking" and interrupts the agent.
+    Gemini's transcript of the caller arrives late - often after Gemini has already started answering - so
+    the agent cut its own reply short ("Great! We...") and then went silent for 21 s (28 Oct, call ee87e8dc);
+    it was also behind the 4-8 "interruptions" per call that broke the voice. Gemini already detects real
+    barge-ins itself, so the aggregator only collects text here."""
+    from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
+    from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
+    return LLMContextAggregatorPair(
+        context, user_params=LLMUserAggregatorParams(user_turn_strategies=ExternalUserTurnStrategies()))
+
+
 _COMPANY_RE = re.compile(r"You work for (.+?)\. When the caller")
 
 
@@ -1091,7 +1105,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
                                                        asyncio.get_event_loop().create_task(save_greeting_db(call_id, token, g_key))))
             if pre_greeted:
                 greeter.played_already()
-                add_turn(stats, "assistant", (agent.get("opening") or "").strip() + " ")
+                add_turn(stats, "assistant", (speakable_opening(agent) or (agent.get("opening") or "").strip()) + " ")
             logger.info(f"call {call_id[:8]} engine: gemini live ({live_model})")
         else:
             stt, llm, tts = build_services(agent, keys, phone)
@@ -1113,7 +1127,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
     if live_model:
         live_context = LLMContext([] if greeted else [opening_message(agent)])
-        live_user, live_assistant = LLMContextAggregatorPair(live_context)
+        live_user, live_assistant = live_aggregators(live_context)
         pipeline = Pipeline([
             transport.input(),
             CallErrors(stats),
