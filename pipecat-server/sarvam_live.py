@@ -117,7 +117,8 @@ class SarvamLiveTTS(SarvamTTSService):
 
     async def run_tts(self, text: str, context_id: str):
         lang = language_for_text(text, self._default_language)
-        if lang != self._settings.language:
+        # Changing the voice config mid-sentence restarts Sarvam's stream; only switch for a clear change of script.
+        if lang != self._settings.language and len(text.strip()) >= 4:
             self._settings.language = lang
             try:
                 if self._websocket:
@@ -138,8 +139,11 @@ def make_live_sarvam_voice(*, api_key: str, voice: str | None, agent_language: s
     default = AGENT_LANGS.get(agent_language or "English", "en-IN")
     tts = SarvamLiveTTS(
         api_key=api_key, sample_rate=sample_rate, default_language=default,
+        # Bigger chunks: each chunk is voiced separately, and 30-150 character pieces made audible joins
+        # mid-sentence (the "breaking" voice). 50-250 keeps whole phrases together; first words still start fast.
         settings=SarvamTTSService.Settings(model="bulbul:v3", voice=speaker, language=default,
-                                           min_buffer_size=30, max_chunk_length=150),
+                                           min_buffer_size=int(os.environ.get("SARVAM_MIN_BUFFER", "50")),
+                                           max_chunk_length=int(os.environ.get("SARVAM_MAX_CHUNK", "250"))),
     )
     tts.speaker = speaker
     logger.info(f"Sarvam voice: {speaker}, default language {default}")
