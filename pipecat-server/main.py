@@ -101,6 +101,7 @@ logger.remove()
 logger.add(sys.stderr, level=os.environ.get("LOG_LEVEL", "INFO"))
 
 PHONE_GAIN = float(os.environ.get("PHONE_GAIN", "1.5"))
+PHONE_IN_BYTES = int(os.environ.get("PHONE_IN_MS", "40")) * 32  # 16 kHz, 16-bit
 
 app = FastAPI(title="VoiceOS Pipecat")
 
@@ -381,6 +382,7 @@ class VobizSerializer(FrameSerializer):
         self.stream_id = stream_id
         self._on_close = on_close
         self.recorder = CallRecorder()  # both sides, as sent/received, for the Recordings page
+        self._pending = bytearray()
 
     @property
     def type(self):
@@ -411,6 +413,11 @@ class VobizSerializer(FrameSerializer):
                 # Soft limiter instead of hard clipping: loud callers were distorted, which garbled what Gemini heard.
                 x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) * (PHONE_GAIN / 32768.0)
                 pcm = (np.tanh(x) * 32767.0).astype(np.int16).tobytes()
+            # Vobiz sends 20 ms packets; passing 40 ms at a time halves the per-frame work on the small server.
+            self._pending.extend(pcm)
+            if len(self._pending) < PHONE_IN_BYTES:
+                return None
+            pcm, self._pending = bytes(self._pending), bytearray()
             return InputAudioRawFrame(audio=pcm, sample_rate=16000, num_channels=1)
         if msg.get("event") == "stop":
             self._on_close("hangup")
@@ -914,7 +921,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         audio_in_sample_rate=16000,
         # Vobiz/Plivo playAudio only accepts L16 at 8000 or 16000 Hz; 24 kHz audio is never played.
         audio_out_sample_rate=16000 if phone else 24000,
-    ))
+    ), enable_rtvi=not phone)  # phone calls have no web client: skip the RTVI layer that touches every frame
     task_ref["task"] = task
 
     @transport.event_handler("on_client_connected")
@@ -1019,7 +1026,7 @@ async def _keep_awake():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "caller-bye-only-2026-10-28"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "pickup-greeting-light-2026-10-28"}
 
 
 @app.websocket("/ws")
