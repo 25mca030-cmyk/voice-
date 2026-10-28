@@ -83,5 +83,30 @@ class PhonePipeline(unittest.IsolatedAsyncioTestCase):
         self.assertIn("LLMTextFrame", sink.seen)
 
 
+class LateTranscriptDoesNotInterrupt(unittest.IsolatedAsyncioTestCase):
+    async def test_caller_transcript_during_reply_does_not_cut_agent(self):
+        from pipecat.frames.frames import TranscriptionFrame
+        from pipecat.processors.aggregators.llm_context import LLMContext
+        user, assistant = main.live_aggregators(LLMContext([]))
+        seen = []
+
+        class Watch(FrameProcessor):
+            async def process_frame(self, frame, direction):
+                await super().process_frame(frame, direction)
+                seen.append(type(frame).__name__)
+                await self.push_frame(frame, direction)
+        watch = Watch()
+        task = PipelineTask(Pipeline([user, watch]), params=PipelineParams(), enable_rtvi=False)
+
+        async def drive():
+            await asyncio.sleep(0.1)
+            await task.queue_frames([BotStartedSpeakingFrame(), TranscriptionFrame("Yes.", "u", "now")])
+            await asyncio.sleep(0.3)
+            await task.queue_frame(EndFrame())
+        await asyncio.gather(PipelineRunner(handle_sigint=False).run(task), drive())
+        self.assertNotIn("InterruptionFrame", seen)
+        self.assertNotIn("StartInterruptionFrame", seen)
+
+
 if __name__ == "__main__":
     unittest.main()
