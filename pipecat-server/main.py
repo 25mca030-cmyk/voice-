@@ -389,6 +389,16 @@ class VobizSerializer(FrameSerializer):
         self._on_close = on_close
         self.recorder = CallRecorder()  # both sides, as sent/received, for the Recordings page
         self._pending = bytearray()
+        # Pipecat sends agent audio at 2x real time, so Vobiz is still playing for a while after the
+        # pipeline reports "bot stopped speaking". play_until tracks when the caller actually stops hearing it.
+        self.play_until = 0.0
+
+    def playing(self, tail: float = 0.4) -> bool:
+        """True while the caller can still hear the agent (plus a short echo tail)."""
+        return time.monotonic() < self.play_until + tail
+
+    def remaining(self) -> float:
+        return max(0.0, self.play_until - time.monotonic())
 
     @property
     def type(self):
@@ -397,9 +407,12 @@ class VobizSerializer(FrameSerializer):
     async def serialize(self, frame: Frame):
         if isinstance(frame, OutputAudioRawFrame):
             self.recorder.add_bot(frame.audio, frame.sample_rate)
+            now = time.monotonic()
+            self.play_until = max(self.play_until, now) + len(frame.audio) / 2 / max(1, frame.sample_rate)
             payload = base64.b64encode(frame.audio).decode()
             return json.dumps({"event": "playAudio", "streamId": self.stream_id, "media": {"contentType": "audio/x-l16", "sampleRate": frame.sample_rate, "payload": payload}})
         if isinstance(frame, _Interrupt):
+            self.play_until = time.monotonic()
             return json.dumps({"event": "clearAudio", "streamId": self.stream_id})
         return None
 
@@ -651,15 +664,24 @@ class BargeInGuard(FrameProcessor):
     (28 Oct) - that was the "breaking" voice. Short sounds during the agent's speech are replaced with
     silence; speech that stays loud for BARGE_MS is a real interruption and is passed on in full."""
 
-    def __init__(self, barge_ms: int = 350):
+    def __init__(self, barge_ms: int = 350, clock=None):
         super().__init__()
         self._barge_ms = barge_ms
+        self._clock = clock  # VobizSerializer: knows when the caller really stops hearing the agent
         self._bot = False
+        self.opened = 0
         self._loud_ms = 0.0
         self._quiet_ms = 0.0
         self._open = False
         self._held: list = []
         self._floor = 300.0
+
+    def _bot_audible(self) -> bool:
+        if self._clock is not None:
+            # The agent's own voice echoes back on the line until it has finished playing on the phone,
+            # which is up to half a reply after Pipecat says it stopped: guard until then.
+            return self._bot or self._clock.playing()
+        return self._bot
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -667,10 +689,19 @@ class BargeInGuard(FrameProcessor):
             self._bot, self._open, self._loud_ms, self._held = True, False, 0.0, []
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot = False
-            for held in self._held:  # anything held back is still the caller's speech
-                await self.push_frame(held, FrameDirection.DOWNSTREAM)
-            self._held = []
-        elif isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM and self._bot:
+            if self._clock is None:
+                for held in self._held:  # anything held back is still the caller's speech
+                    await self.push_frame(held, FrameDirection.DOWNSTREAM)
+                self._held = []
+        elif (isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM
+              and self._held and not self._bot_audible()):
+            # Agent audio finished playing on the phone: anything held back is still the caller's speech.
+            held, self._held = self._held, []
+            for h in held:
+                await self.push_frame(h, FrameDirection.DOWNSTREAM)
+            await self.push_frame(frame, direction)
+            return
+        elif isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM and self._bot_audible():
             samples = np.frombuffer(frame.audio, dtype=np.int16)
             rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))) if samples.size else 0.0
             ms = 1000 * samples.size / max(1, frame.sample_rate)
@@ -686,6 +717,8 @@ class BargeInGuard(FrameProcessor):
             if self._open or self._loud_ms >= self._barge_ms:
                 if not self._open:
                     self._open = True
+                    self.opened += 1
+                    logger.info(f"caller interrupted the agent (level {rms:.0f}, threshold {threshold:.0f})")
                     for held in self._held:  # let Gemini hear the start of the interruption
                         await self.push_frame(held, FrameDirection.DOWNSTREAM)
                     self._held = []
@@ -880,7 +913,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         stats["reason"] = "farewell"
 
         async def _end():
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(0.8 + (serializer.remaining() if hasattr(serializer, "remaining") else 0.0))
             logger.info(f"call {call_id[:8]} ending after farewell")
             await finish()
             await asyncio.sleep(0.5)
@@ -1079,7 +1112,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             *([OpeningGuard(max_secs=max(0.0, pre_greeted_until - time.time()) if pre_greeted else 12.0)]
               if phone and agent.get("opening") else []),
             VoiceClock(stats),
-            *([BargeInGuard()] if phone else []),
+            *([BargeInGuard(clock=serializer)] if phone else []),
             Tracker(stats, "input", not phone),  # VAD, latency, goodbye hang-up
             live_user,
             # Caller transcript: Gemini Live sends it upstream and the user aggregator swallows it, so this
