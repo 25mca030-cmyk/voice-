@@ -24,6 +24,20 @@ class Recorder(unittest.TestCase):
             self.assertEqual((w.getframerate(), w.getnchannels()), (16000, 1))
             self.assertGreaterEqual(w.getnframes(), 32000)
 
+    def test_quiet_caller_is_audible_next_to_loud_agent(self):
+        # 28 Oct: the customer could not be heard in the recording (phone audio is much quieter).
+        import time
+        r = call_recording.CallRecorder()
+        t = np.arange(320) / 16000
+        quiet = (np.sin(2 * np.pi * 300 * t) * 700).astype(np.int16).tobytes()
+        for _ in range(100):  # 2 s of quiet caller speech
+            r.add_user(quiet)
+        r._bot = [(r._t0 + 2.0, (np.sin(2 * np.pi * 300 * np.arange(32000) / 16000) * 20000).astype(np.int16).tobytes())]
+        with wave.open(io.BytesIO(r.wav())) as w:
+            x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
+        caller_peak, agent_peak = np.abs(x[:32000]).max(), np.abs(x[32000:]).max()
+        self.assertGreater(caller_peak, agent_peak * 0.6)
+
     def test_too_short_is_skipped(self):
         r = call_recording.CallRecorder()
         r.add_user(b"\x00\x00" * 100)

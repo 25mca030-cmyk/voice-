@@ -141,6 +141,7 @@ class PreSessionGreeting(unittest.TestCase):
             async def no_connect(self, *a, **kw):
                 return None
             with patch.object(main, "voiceos", slow_voiceos), patch.object(main, "pick_live_model", fake_pick), \
+                    patch.object(main, "HELLO_WAIT_S", 0.1), \
                     patch.object(main, "thinking_supported", ok), \
                     patch("pipecat.services.google.gemini_live.llm.GeminiLiveLLMService._connect", no_connect):
                 from fastapi.testclient import TestClient
