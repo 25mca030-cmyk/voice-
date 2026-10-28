@@ -243,7 +243,11 @@ def build_live_llm(*, key: str, model: str, agent: dict, tools_schema, phone: bo
             # reply at all, another waited 7 s). HIGH hears them at once; the echo guard keeps the agent's own
             # voice out, so it does not interrupt itself.
             start_sensitivity=StartSensitivity.START_SENSITIVITY_HIGH,
-            end_sensitivity=EndSensitivity.END_SENSITIVITY_LOW,
+            # HIGH: phone-line hiss after a short "Yes" kept Gemini thinking the caller was still talking, so
+            # the first answer after the greeting came 10-11 s late (28 Oct calls 945da1d5, 573f6ee1).
+            # The 550 ms silence window below still lets people finish their sentence.
+            end_sensitivity=(EndSensitivity.END_SENSITIVITY_LOW if os.environ.get("LIVE_END_SENSITIVITY") == "low"
+                             else EndSensitivity.END_SENSITIVITY_HIGH),
             # Silence before Gemini treats the caller's turn as finished: this is most of the reply delay.
             silence_duration_ms=SILENCE_MS,
             prefix_padding_ms=100,

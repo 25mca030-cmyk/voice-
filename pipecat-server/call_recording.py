@@ -51,6 +51,34 @@ class CallRecorder:
             self._t0 = time.monotonic()
         self._bot.append((time.monotonic(), bytes(pcm)))
 
+    def turn_gaps(self) -> list[float]:
+        """Seconds between the caller going quiet and the agent's voice starting, as heard on the call."""
+        if self._t0 is None or not self._bot:
+            return []
+        win = RATE // 20  # 50 ms
+        user = np.frombuffer(bytes(self._user), dtype=np.int16).astype(np.float32)
+        n = len(user) // win
+        if not n:
+            return []
+        rms = np.sqrt((user[:n * win].reshape(n, win) ** 2).mean(1))
+        floor = float(np.percentile(rms, 20))
+        talk = rms > max(150.0, floor * 3)
+        starts, last, prev = [], -10.0, None  # agent starts: first chunk after >0.6 s without agent audio
+        for t, pcm in self._bot:
+            if prev is None or t - prev > 0.6:
+                starts.append(t - self._t0)
+            prev = t + len(pcm) / 2 / RATE
+        gaps = []
+        for st in starts:
+            i = min(n, int(st / 0.05))
+            j = i - 1
+            while j >= 0 and not talk[j]:
+                j -= 1
+            if j >= 0 and (i - j) * 0.05 < 15 and (j * 0.05) > last:
+                gaps.append(round((i - 1 - j) * 0.05, 2))
+                last = st
+        return gaps
+
     def wav(self) -> bytes | None:
         if self._t0 is None:
             return None

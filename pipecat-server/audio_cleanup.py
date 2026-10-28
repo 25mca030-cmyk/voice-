@@ -16,7 +16,9 @@ from pipecat.audio.filters.base_audio_filter import BaseAudioFilter
 
 class NoiseGate(BaseAudioFilter):
     # Gentle settings: a hard gate made short pauses inside a sentence sound like silence to Gemini.
-    def __init__(self, *, open_ratio: float = 2.0, floor_gain: float = 0.4, hold_ms: int = 700,
+    # 28 Oct: hold 700 ms / floor 0.4 let line hiss through for longer than Gemini's 550 ms end-of-turn
+    # window, so it did not notice the caller had finished. Shorter hold, quieter floor between words.
+    def __init__(self, *, open_ratio: float = 2.0, floor_gain: float = 0.15, hold_ms: int = 300,
                  highpass_hz: float = 120.0):
         self._open_ratio = open_ratio
         self._floor_gain = floor_gain

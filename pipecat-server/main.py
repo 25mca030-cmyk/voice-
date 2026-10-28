@@ -977,6 +977,13 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             pass
         if phone and os.environ.get("RECORDINGS") == "1":
             try:
+                try:
+                    gaps = serializer.recorder.turn_gaps()
+                    if gaps:
+                        logger.info(f"call {call_id[:8]} heard reply gaps (caller quiet -> agent voice): "
+                                    f"{gaps} s, median {sorted(gaps)[len(gaps) // 2]} s")
+                except Exception:
+                    pass
                 await save_recording(_bridge(), call_id, token, serializer.recorder.wav())
             except Exception as e:  # a recording must never block saving the call
                 logger.warning(f"recording skipped: {type(e).__name__}")
