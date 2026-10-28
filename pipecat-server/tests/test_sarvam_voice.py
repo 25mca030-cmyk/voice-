@@ -4,8 +4,9 @@ import unittest
 os.environ.setdefault("PIPECAT_SHARED_SECRET", "test-only")
 import main  # noqa: E402
 import sarvam_live  # noqa: E402
-from pipecat.frames.frames import (ErrorFrame, LLMFullResponseEndFrame, LLMTextFrame, TTSAudioRawFrame,  # noqa: E402
-                                   TTSStartedFrame, TTSTextFrame)
+import asyncio  # noqa: E402
+from pipecat.frames.frames import (ErrorFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame,  # noqa: E402
+                                   LLMTextFrame, TTSAudioRawFrame, TTSStartedFrame, TTSTextFrame)
 from pipecat.processors.frame_processor import FrameDirection  # noqa: E402
 
 DOWN, UP = FrameDirection.DOWNSTREAM, FrameDirection.UPSTREAM
@@ -33,6 +34,17 @@ class Languages(unittest.TestCase):
         self.assertEqual(tts.speaker, some)
 
 
+class Opening(unittest.TestCase):
+    def test_company_filled(self):
+        agent = {"opening": "Hi, this is sam from [Company]. Do you have a moment?",
+                 "instructions": "x\n\nYou work for Marketing ai. When the caller asks your company name..."}
+        self.assertEqual(main.speakable_opening(agent), "Hi, this is sam from Marketing ai. Do you have a moment?")
+
+    def test_unfilled_placeholder_left_to_gemini(self):
+        self.assertEqual(main.speakable_opening({"opening": "Hi from [Company]", "instructions": ""}), "")
+        self.assertEqual(main.speakable_opening({"opening": "", "instructions": ""}), "")
+
+
 class AudioDrop(unittest.IsolatedAsyncioTestCase):
     def make(self):
         sarvam = object()
@@ -46,11 +58,25 @@ class AudioDrop(unittest.IsolatedAsyncioTestCase):
 
     async def test_gemini_audio_dropped_text_passed(self):
         drop, _, out = self.make()
-        frames = [TTSStartedFrame(), TTSAudioRawFrame(b"\0" * 480, 24000, 1), TTSTextFrame("Hi", aggregated_by="sentence"),
-                  LLMTextFrame("Hi there."), LLMFullResponseEndFrame()]
+        frames = [TTSStartedFrame(), LLMFullResponseStartFrame(), TTSAudioRawFrame(b"\0" * 480, 24000, 1),
+                  TTSTextFrame("Hi", aggregated_by="sentence"), LLMTextFrame("Hi there."), LLMFullResponseEndFrame()]
         for f in frames:
             await drop.process_frame(f, DOWN)
-        self.assertEqual([type(f) for f in out], [LLMTextFrame, LLMFullResponseEndFrame])
+        self.assertEqual([type(f) for f in out], [LLMFullResponseStartFrame, LLMTextFrame, LLMFullResponseEndFrame])
+
+    async def test_late_transcript_is_spoken_now_not_next_turn(self):
+        drop, _, out = self.make()
+        await drop.process_frame(LLMFullResponseEndFrame(), DOWN)  # Gemini says the turn is over...
+        await drop.process_frame(LLMTextFrame("and one more thing."), DOWN)  # ...then late words arrive
+        await asyncio.sleep(drop.IDLE_FLUSH_S + 0.15)
+        self.assertEqual([type(f) for f in out], [LLMFullResponseStartFrame, LLMTextFrame, LLMFullResponseEndFrame])
+
+    async def test_interruption_resets(self):
+        drop, _, out = self.make()
+        await drop.process_frame(LLMTextFrame("Hello"), DOWN)
+        await drop.process_frame(main._Interrupt(), DOWN)
+        await asyncio.sleep(drop.IDLE_FLUSH_S + 0.15)
+        self.assertNotIn(LLMFullResponseEndFrame, [type(f) for f in out])
 
     async def test_sarvam_error_falls_back_to_gemini_voice(self):
         drop, sarvam, out = self.make()
