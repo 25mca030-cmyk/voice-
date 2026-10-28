@@ -956,6 +956,21 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             await finish()
 
 
+async def lookup_call_agent(call_id: str, token: str) -> str:
+    """Agent id for this call via the token-checked pipecat_call_agent database function ('' if unavailable)."""
+    url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    key = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "")
+    if not url or not key or not re.fullmatch(r"[0-9a-fA-F-]{36}", call_id or ""):
+        return ""
+    try:
+        r = await _bridge().post(f"{url}/rest/v1/rpc/pipecat_call_agent", headers={"apikey": key},
+                                 json={"p_call": call_id, "p_token": token}, timeout=2.0)
+        aid = r.json() if r.status_code == 200 else None
+        return aid if isinstance(aid, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", aid) else ""
+    except Exception:
+        return ""
+
+
 async def play_instant_greeting(ws: WebSocket, stream_id: str, agent_id: str, opened_at: float) -> float:
     """Sends this agent's saved greeting to Vobiz the moment the call connects, before the agent loads.
 
@@ -1002,7 +1017,7 @@ async def _keep_awake():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "recordings-ready-2026-10-27"}
+    return {"ok": True, "configured": bool(SECRET), "voiceos": VOICEOS_URL, "revision": "pickup-greeting-2026-10-28"}
 
 
 @app.websocket("/ws")
@@ -1019,6 +1034,11 @@ async def phone_ws(ws: WebSocket):
     logger.info(f"phone stream opened for call {call_id[:8]}")
     # Load the agent while Vobiz is still sending its start event.
     session_task = asyncio.create_task(voiceos("session", {"call_id": call_id, "token": ws.query_params.get("token", "")}))
+    # Which agent is this call for? A one-row database lookup (~0.2 s) instead of waiting ~5 s for VoiceOS,
+    # so the agent's saved greeting can play the moment the phone is picked up.
+    agent_task = None
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", ws.query_params.get("agent", "") or ""):
+        agent_task = asyncio.create_task(lookup_call_agent(call_id, ws.query_params.get("token", "")))
     stream_id = ""
     # Vobiz sends a "start" event first (text or binary JSON); never crash or hang before the call starts.
     try:
@@ -1043,6 +1063,11 @@ async def phone_ws(ws: WebSocket):
         return
     try:
         agent_id = ws.query_params.get("agent", "")
+        if agent_task:
+            try:
+                agent_id = await asyncio.wait_for(agent_task, 2.0) or ""
+            except Exception:
+                agent_id = ""
         pre_greeted_until = 0.0
         if re.fullmatch(r"[0-9a-fA-F-]{36}", agent_id or "") and stream_id:
             pre_greeted_until = await play_instant_greeting(ws, stream_id, agent_id, stream_opened_at)
