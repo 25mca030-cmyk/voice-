@@ -34,6 +34,7 @@ from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
     InterimTranscriptionFrame,
+    LLMTextFrame,
     MetricsFrame,
     OutputAudioRawFrame,
     TranscriptionFrame,
@@ -546,6 +547,35 @@ class GreetingPlayer(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class GeminiAudioDrop(FrameProcessor):
+    """Sarvam voice on Gemini Live: Gemini's own audio is dropped and its live transcript goes to Sarvam.
+
+    If Sarvam fails during the call (bad key, quota, network), this switches back to Gemini's voice for
+    the rest of the call and stops feeding Sarvam, so the caller never gets silence or a double voice."""
+
+    def __init__(self, sarvam):
+        super().__init__()
+        self._sarvam = sarvam
+        self.fallback = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if direction == FrameDirection.UPSTREAM:
+            if isinstance(frame, ErrorFrame) and not self.fallback and getattr(frame, "processor", None) is self._sarvam:
+                self.fallback = True
+                logger.warning(f"Sarvam voice failed ({str(frame.error)[:100]}); using Gemini's voice for this call")
+                if not frame.fatal:
+                    return  # handled here: the call carries on in Gemini's voice
+            await self.push_frame(frame, direction)
+            return
+        if self.fallback:
+            if isinstance(frame, LLMTextFrame):
+                return  # Gemini speaks itself now; Sarvam must not speak too
+        elif isinstance(frame, (TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, TTSTextFrame)):
+            return  # Sarvam speaks (and transcribes) the reply instead
+        await self.push_frame(frame, direction)
+
+
 class BargeInGuard(FrameProcessor):
     """While the agent talks, only sustained caller speech reaches Gemini.
 
@@ -912,13 +942,24 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
     tools_schema = ToolsSchema(standard_tools=schemas) if schemas else None
 
     try:
+        sarvam_voice = None
         if live_model:
             stt = tts = None
             try:
                 fast = await asyncio.wait_for(thinking_task, 3.5)
             except Exception:
                 fast = False
-            g_key = greeting_key(agent, live_model)
+            sarvam_voice = None
+            if os.environ.get("LIVE_TTS", "sarvam") == "sarvam":
+                # Gemini Live listens and thinks; Sarvam Bulbul speaks in the agent's chosen voice.
+                from sarvam_live import make_live_sarvam_voice
+                try:
+                    sarvam_voice = make_live_sarvam_voice(
+                        api_key=key(keys, "sarvam", "SARVAM_API_KEY"), voice=agent.get("voice"),
+                        agent_language=agent.get("language"), sample_rate=16000 if phone else 24000)
+                except Exception as e:
+                    logger.warning(f"Sarvam voice unavailable ({type(e).__name__}); using Gemini's voice")
+            g_key = greeting_key(agent, live_model + (f"|sarvam:{sarvam_voice.speaker}" if sarvam_voice else ""))
             g_cached = cached_greeting(g_key)
             pre_greeted = bool(pre_greeted_until) and g_cached is not None
             if g_cached:
@@ -969,6 +1010,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             # must sit right next to the model (it was before the aggregator: no caller text, no "bye" hang-up).
             Tracker(stats, "stt", not phone),
             llm,
+            *([GeminiAudioDrop(sarvam_voice), sarvam_voice] if sarvam_voice else []),  # Sarvam speaks
             greeter,  # instant cached greeting (or records the first one)
             Tracker(stats, "assistant", not phone),  # agent transcript
             transport.output(),
