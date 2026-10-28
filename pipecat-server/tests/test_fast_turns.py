@@ -173,6 +173,15 @@ class BargeIn(unittest.IsolatedAsyncioTestCase):
         await g.process_frame(InputAudioRawFrame(audio=echo, sample_rate=16000, num_channels=1), FrameDirection.DOWNSTREAM)
         self.assertGreater(out[-1], 0)
 
+    def test_pipeline_clock_does_not_replace_playout_clock(self):
+        # Pipecat gives every processor its own self._clock (a SystemClock) when the call starts;
+        # on 28 Oct that overwrote the guard's playout clock and every caller frame raised an error.
+        ser = main.VobizSerializer("S", lambda r: None)
+        g = main.BargeInGuard(clock=ser)
+        g._clock = object()  # what Pipecat's setup() does
+        ser.play_until = time.monotonic() + 1.0
+        self.assertTrue(g._bot_audible())
+
     def test_hangup_waits_for_playback(self):
         ser = main.VobizSerializer("S", lambda r: None)
         ser.play_until = time.monotonic() + 2.0
