@@ -137,13 +137,16 @@ def make_live_sarvam_voice(*, api_key: str, voice: str | None, agent_language: s
     if speaker not in V3_SPEAKERS:
         speaker = DEFAULT_SARVAM_VOICE if DEFAULT_SARVAM_VOICE in V3_SPEAKERS else "ishita"
     default = AGENT_LANGS.get(agent_language or "English", "en-IN")
+    from pipecat.services.tts_service import TextAggregationMode
+    stream = os.environ.get("SARVAM_STREAM", "token") == "token"
     tts = SarvamLiveTTS(
         api_key=api_key, sample_rate=sample_rate, default_language=default,
-        # Bigger chunks: each chunk is voiced separately, and 30-150 character pieces made audible joins
-        # mid-sentence (the "breaking" voice). 50-250 keeps whole phrases together; first words still start fast.
+        # Token streaming: Gemini's words go to Sarvam as they arrive instead of waiting for each full
+        # sentence (that wait added ~1 s per reply on 28 Oct). Sarvam buffers min_buffer_size characters itself.
+        **({"text_aggregation_mode": TextAggregationMode.TOKEN} if stream else {}),
         settings=SarvamTTSService.Settings(model="bulbul:v3", voice=speaker, language=default,
-                                           min_buffer_size=int(os.environ.get("SARVAM_MIN_BUFFER", "50")),
-                                           max_chunk_length=int(os.environ.get("SARVAM_MAX_CHUNK", "250"))),
+                                           min_buffer_size=int(os.environ.get("SARVAM_MIN_BUFFER", "30")),
+                                           max_chunk_length=int(os.environ.get("SARVAM_MAX_CHUNK", "200"))),
     )
     tts.speaker = speaker
     logger.info(f"Sarvam voice: {speaker}, default language {default}")

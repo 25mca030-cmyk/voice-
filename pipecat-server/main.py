@@ -1058,7 +1058,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             sarvam_voice = None
             # Gemini's own voice is the default: Sarvam on top of Gemini added 2-3 s per reply on real calls
             # (28 Oct, call 224a2701: 3.2 s, 2.5 s, 2.1 s vs 0.5-1.3 s). LIVE_TTS=sarvam turns Sarvam back on.
-            if os.environ.get("LIVE_TTS", "gemini") == "sarvam":
+            if os.environ.get("LIVE_TTS", "sarvam") == "sarvam":
                 # Gemini Live listens and thinks; Sarvam Bulbul speaks in the agent's chosen voice.
                 from sarvam_live import make_live_sarvam_voice
                 try:
@@ -1069,11 +1069,16 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
                     logger.warning(f"Sarvam voice unavailable ({type(e).__name__}); using Gemini's voice")
             g_key = greeting_key(agent, live_model + (f"|sarvam:{sarvam_voice.speaker}" if sarvam_voice else ""))
             g_cached = cached_greeting(g_key)
-            pre_greeted = bool(pre_greeted_until) and g_cached is not None
+            pre_greeted = bool(pre_greeted_until)
+            if pre_greeted and g_cached is None and agent_id:
+                # The saved greeting was made before the agent's opening or voice changed: it has played
+                # this time, but drop it so the next call records the current one.
+                remember_agent_greeting(agent_id, "stale")
+                asyncio.get_event_loop().create_task(forget_greeting_db(call_id, token))
             # No saved greeting yet (first call after a restart): Sarvam speaks the opening text itself the
             # moment the call connects, instead of waiting ~3 s for Gemini to connect and compose it.
-            sarvam_opening = speakable_opening(agent) if sarvam_voice and not g_cached else ""
-            greeted = bool(g_cached) or bool(sarvam_opening)
+            sarvam_opening = speakable_opening(agent) if sarvam_voice and not g_cached and not pre_greeted else ""
+            greeted = bool(g_cached) or bool(sarvam_opening) or pre_greeted
             if g_cached:
                 remember_agent_greeting(agent_id, g_key)
             elif agent_id:
@@ -1082,7 +1087,8 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
                                  agent=already_greeted_agent(agent) if greeted else agent,
                                  tools_schema=tools_schema, phone=phone, thinking=fast, speak_first=not greeted)
             greeter = GreetingPlayer(g_key, g_cached, (agent.get("opening") or "").strip(),
-                                     on_saved=lambda: remember_agent_greeting(*stats.get("remember_greeting_for", ("", None))))
+                                     on_saved=lambda: (remember_agent_greeting(*stats.get("remember_greeting_for", ("", None))),
+                                                       asyncio.get_event_loop().create_task(save_greeting_db(call_id, token, g_key))))
             if pre_greeted:
                 greeter.played_already()
                 add_turn(stats, "assistant", (agent.get("opening") or "").strip() + " ")
@@ -1227,6 +1233,55 @@ async def lookup_call_agent(call_id: str, token: str) -> str:
         return ""
 
 
+async def _greeting_rpc(name: str, payload: dict, timeout: float):
+    url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    key = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "")
+    if not url or not key:
+        return None
+    r = await _bridge().post(f"{url}/rest/v1/rpc/{name}", headers={"apikey": key}, json=payload, timeout=timeout)
+    return r.json() if r.status_code == 200 else None
+
+
+async def load_saved_greeting(call_id: str, token: str, agent_id: str) -> bool:
+    """Greeting audio saved in the VoiceOS database (survives server restarts and updates).
+
+    The local cache is wiped on every deploy, so the first call after an update used to wait ~7 s for
+    the agent to load and speak. The saved copy lets every call greet the moment it is answered."""
+    if greeting_for_agent(agent_id):
+        return True
+    try:
+        g = await _greeting_rpc("pipecat_get_greeting", {"p_call": call_id, "p_token": token}, 1.5)
+        if not isinstance(g, dict) or not g.get("pcm") or not g.get("key"):
+            return False
+        store_greeting(str(g["key"]), int(g["rate"]), base64.b64decode(g["pcm"]))
+        remember_agent_greeting(agent_id, str(g["key"]))
+        return bool(greeting_for_agent(agent_id))
+    except Exception as e:
+        logger.warning(f"saved greeting unavailable ({type(e).__name__})")
+        return False
+
+
+async def save_greeting_db(call_id: str, token: str, key: str | None):
+    """Keeps the newly recorded greeting in the database for calls after the next restart."""
+    g = cached_greeting(key)
+    if not g:
+        return
+    try:
+        ok = await _greeting_rpc("pipecat_save_greeting", {"p_call": call_id, "p_token": token, "p_key": key,
+                                 "p_rate": g[0], "p_pcm": base64.b64encode(g[1]).decode()}, 10)
+        logger.info("greeting saved for future calls" if ok is True else "greeting not saved to database")
+    except Exception as e:
+        logger.warning(f"greeting not saved to database ({type(e).__name__})")
+
+
+async def forget_greeting_db(call_id: str, token: str):
+    try:
+        await _greeting_rpc("pipecat_save_greeting", {"p_call": call_id, "p_token": token, "p_key": "",
+                                                      "p_rate": 16000, "p_pcm": ""}, 5)
+    except Exception:
+        pass
+
+
 async def play_instant_greeting(ws: WebSocket, stream_id: str, agent_id: str, opened_at: float) -> float:
     """Sends this agent's saved greeting to Vobiz the moment the call connects, before the agent loads.
 
@@ -1326,6 +1381,7 @@ async def phone_ws(ws: WebSocket):
                 agent_id = ""
         pre_greeted_until = 0.0
         if re.fullmatch(r"[0-9a-fA-F-]{36}", agent_id or "") and stream_id:
+            await load_saved_greeting(call_id, ws.query_params.get("token", ""), agent_id)
             pre_greeted_until = await play_instant_greeting(ws, stream_id, agent_id, stream_opened_at)
         await run_call(ws, call_id, ws.query_params.get("token", ""), phone=True, stream_id=stream_id,
                        session_task=session_task, stream_opened_at=stream_opened_at,
