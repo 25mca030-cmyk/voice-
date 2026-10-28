@@ -112,3 +112,14 @@ class LivePipelineOrder(unittest.TestCase):
         i_user = src.index("            live_user,\n")
         i_stt = src.index('Tracker(stats, "stt", not phone),\n            llm,')
         self.assertLess(i_user, i_stt)
+
+
+class InboundBatching(unittest.TestCase):
+    def test_two_20ms_packets_make_one_40ms_frame(self):
+        import base64
+        import json
+        ser = main.VobizSerializer("S", lambda r: None)
+        pkt = json.dumps({"event": "media", "media": {"payload": base64.b64encode(b"\x00\x01" * 320).decode(), "track": "inbound"}})
+        self.assertIsNone(asyncio.run(ser.deserialize(pkt)))
+        frame = asyncio.run(ser.deserialize(pkt))
+        self.assertEqual(len(frame.audio), 1280)
