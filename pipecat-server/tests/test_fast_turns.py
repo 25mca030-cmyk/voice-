@@ -150,6 +150,34 @@ class BargeIn(unittest.IsolatedAsyncioTestCase):
         out = await self.run_guard(12)  # 480 ms of real speech
         self.assertTrue(any(v > 0 for v in out))
 
+    async def test_echo_guarded_until_phone_finishes_playing(self):
+        # Pipecat sends audio at 2x speed: "bot stopped" arrives while the phone still plays the reply.
+        import numpy as np
+        from pipecat.frames.frames import InputAudioRawFrame, OutputAudioRawFrame
+        ser = main.VobizSerializer("S", lambda r: None)
+        await ser.serialize(OutputAudioRawFrame(audio=b"\x00\x00" * 16000, sample_rate=16000, num_channels=1))  # 1 s
+        g = main.BargeInGuard(clock=ser)
+        out = []
+
+        async def push(frame, direction=FrameDirection.DOWNSTREAM):
+            if isinstance(frame, InputAudioRawFrame):
+                out.append(int(np.abs(np.frombuffer(frame.audio, dtype=np.int16)).max()))
+        g.push_frame = push
+        await g.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
+        await g.process_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
+        echo = (np.ones(640, dtype=np.int16) * 4000).tobytes()
+        for _ in range(3):  # 120 ms of the agent's own echo, still playing on the phone
+            await g.process_frame(InputAudioRawFrame(audio=echo, sample_rate=16000, num_channels=1), FrameDirection.DOWNSTREAM)
+        self.assertTrue(all(v == 0 for v in out))
+        ser.play_until = 0.0  # playback finished
+        await g.process_frame(InputAudioRawFrame(audio=echo, sample_rate=16000, num_channels=1), FrameDirection.DOWNSTREAM)
+        self.assertGreater(out[-1], 0)
+
+    def test_hangup_waits_for_playback(self):
+        ser = main.VobizSerializer("S", lambda r: None)
+        ser.play_until = time.monotonic() + 2.0
+        self.assertGreater(ser.remaining(), 1.5)
+
 
 class SavedAgentStart(unittest.TestCase):
     def test_second_call_starts_without_waiting_for_voiceos(self):

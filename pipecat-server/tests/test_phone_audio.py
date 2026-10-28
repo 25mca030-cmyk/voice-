@@ -129,7 +129,7 @@ class PhoneBoundaryTests(unittest.IsolatedAsyncioTestCase):
         cls = self.load_class("VobizSerializer", {
             "FrameSerializer": object, "FrameSerializerType": None, "Frame": Frame,
             "OutputAudioRawFrame": FRAMES["TTSAudioRawFrame"], "_Interrupt": FRAMES["InterruptionFrame"],
-            "InputAudioRawFrame": FRAMES["InputAudioRawFrame"], "json": json, "base64": base64,
+            "InputAudioRawFrame": FRAMES["InputAudioRawFrame"], "json": json, "base64": base64, "time": __import__("time"),
             "CallRecorder": type("NoRecorder", (), {"add_bot": lambda *a: None, "add_user": lambda *a: None})})
         serializer = cls("STREAM_1", lambda reason: None)
         audio = next(f for f in frames if isinstance(f, FRAMES["TTSAudioRawFrame"]))
