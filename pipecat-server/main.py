@@ -34,6 +34,8 @@ from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
     InterimTranscriptionFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
     LLMTextFrame,
     MetricsFrame,
     OutputAudioRawFrame,
@@ -547,16 +549,58 @@ class GreetingPlayer(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+_COMPANY_RE = re.compile(r"You work for (.+?)\. When the caller")
+
+
+def speakable_opening(agent: dict) -> str:
+    """The agent's opening line ready to speak, with [Company] filled in; "" if it still has placeholders."""
+    text = (agent.get("opening") or "").strip()
+    m = _COMPANY_RE.search(agent.get("instructions") or "")
+    if m:
+        text = re.sub(r"\[(company|company name)\]", m.group(1).strip(), text, flags=re.I)
+    return "" if (not text or "[" in text or "{" in text) else text
+
+
 class GeminiAudioDrop(FrameProcessor):
     """Sarvam voice on Gemini Live: Gemini's own audio is dropped and its live transcript goes to Sarvam.
 
+    Gemini's transcript can arrive a little after Gemini reports the turn finished. Those late words used
+    to wait inside the TTS until the next reply and were then spoken out of place (28 Oct: the agent
+    "talking by itself" and skipping parts of the script). Here every burst of text is wrapped in its own
+    start/end so it is spoken right away, in order.
+
     If Sarvam fails during the call (bad key, quota, network), this switches back to Gemini's voice for
     the rest of the call and stops feeding Sarvam, so the caller never gets silence or a double voice."""
+
+    IDLE_FLUSH_S = 0.8  # only for words that arrive after Gemini ended the turn; normal replies flush at once
 
     def __init__(self, sarvam):
         super().__init__()
         self._sarvam = sarvam
         self.fallback = False
+        self._open = False
+        self._timer: asyncio.Task | None = None
+
+    def _cancel_timer(self):
+        if self._timer and not self._timer.done() and self._timer is not asyncio.current_task():
+            self._timer.cancel()
+        self._timer = None
+
+    async def _close(self):
+        self._cancel_timer()
+        if self._open:
+            self._open = False
+            await self.push_frame(LLMFullResponseEndFrame())
+
+    async def _idle_close(self):
+        try:
+            await asyncio.sleep(self.IDLE_FLUSH_S)
+        except asyncio.CancelledError:
+            return
+        self._timer = None
+        if self._open:
+            self._open = False
+            await self.push_frame(LLMFullResponseEndFrame())
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -571,8 +615,32 @@ class GeminiAudioDrop(FrameProcessor):
         if self.fallback:
             if isinstance(frame, LLMTextFrame):
                 return  # Gemini speaks itself now; Sarvam must not speak too
-        elif isinstance(frame, (TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, TTSTextFrame)):
+            await self.push_frame(frame, direction)
+            return
+        if isinstance(frame, (TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, TTSTextFrame)):
             return  # Sarvam speaks (and transcribes) the reply instead
+        if isinstance(frame, LLMFullResponseStartFrame):
+            return  # replaced by our own start, sent with the first words
+        if isinstance(frame, LLMFullResponseEndFrame):
+            await self._close()  # Gemini finished: speak whatever is left now
+            return
+        if isinstance(frame, _Interrupt):
+            self._cancel_timer()
+            self._open = False  # the TTS drops its pending text on interruption
+            await self.push_frame(frame, direction)
+            return
+        if isinstance(frame, LLMTextFrame):
+            if not frame.text:
+                return
+            if not self._open:
+                self._open = True
+                await self.push_frame(LLMFullResponseStartFrame())
+            await self.push_frame(frame, direction)
+            self._cancel_timer()
+            self._timer = asyncio.create_task(self._idle_close())
+            return
+        if isinstance(frame, EndFrame):
+            await self._close()
         await self.push_frame(frame, direction)
 
 
@@ -943,6 +1011,8 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
 
     try:
         sarvam_voice = None
+        g_cached = sarvam_opening = None
+        greeted = False
         if live_model:
             stt = tts = None
             try:
@@ -962,13 +1032,17 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             g_key = greeting_key(agent, live_model + (f"|sarvam:{sarvam_voice.speaker}" if sarvam_voice else ""))
             g_cached = cached_greeting(g_key)
             pre_greeted = bool(pre_greeted_until) and g_cached is not None
+            # No saved greeting yet (first call after a restart): Sarvam speaks the opening text itself the
+            # moment the call connects, instead of waiting ~3 s for Gemini to connect and compose it.
+            sarvam_opening = speakable_opening(agent) if sarvam_voice and not g_cached else ""
+            greeted = bool(g_cached) or bool(sarvam_opening)
             if g_cached:
                 remember_agent_greeting(agent_id, g_key)
             elif agent_id:
                 stats["remember_greeting_for"] = (agent_id, g_key)
             llm = build_live_llm(key=gemini_key, model=live_model,
-                                 agent=already_greeted_agent(agent) if g_cached else agent,
-                                 tools_schema=tools_schema, phone=phone, thinking=fast, speak_first=not g_cached)
+                                 agent=already_greeted_agent(agent) if greeted else agent,
+                                 tools_schema=tools_schema, phone=phone, thinking=fast, speak_first=not greeted)
             greeter = GreetingPlayer(g_key, g_cached, (agent.get("opening") or "").strip(),
                                      on_saved=lambda: remember_agent_greeting(*stats.get("remember_greeting_for", ("", None))))
             if pre_greeted:
@@ -994,7 +1068,7 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         llm.register_function(name, handler)
 
     if live_model:
-        live_context = LLMContext([] if g_cached else [opening_message(agent)])
+        live_context = LLMContext([] if greeted else [opening_message(agent)])
         live_user, live_assistant = LLMContextAggregatorPair(live_context)
         pipeline = Pipeline([
             transport.input(),
@@ -1064,6 +1138,8 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
         if live_model:
             if g_cached and not pre_greeted:
                 await greeter.play()  # caller hears the greeting now; Gemini connects meanwhile
+            elif sarvam_opening:
+                await task.queue_frame(TTSSpeakFrame(sarvam_opening))  # Sarvam greets while Gemini connects
             await task.queue_frame(LLMRunFrame())  # Gemini Live speaks the opening (first call) / gets context
         elif agent.get("opening"):
             context.add_messages([{"role": "assistant", "content": agent["opening"]}])
