@@ -1020,7 +1020,9 @@ async def run_call(ws: WebSocket, call_id: str, token: str, phone: bool, stream_
             except Exception:
                 fast = False
             sarvam_voice = None
-            if os.environ.get("LIVE_TTS", "sarvam") == "sarvam":
+            # Gemini's own voice is the default: Sarvam on top of Gemini added 2-3 s per reply on real calls
+            # (28 Oct, call 224a2701: 3.2 s, 2.5 s, 2.1 s vs 0.5-1.3 s). LIVE_TTS=sarvam turns Sarvam back on.
+            if os.environ.get("LIVE_TTS", "gemini") == "sarvam":
                 # Gemini Live listens and thinks; Sarvam Bulbul speaks in the agent's chosen voice.
                 from sarvam_live import make_live_sarvam_voice
                 try:

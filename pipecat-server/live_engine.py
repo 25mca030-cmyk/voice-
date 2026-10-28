@@ -110,7 +110,10 @@ def forget_live_model(key: str):
 
 def live_instructions(agent: dict) -> str:
     return (agent["instructions"]
-            + "\n\nThis is a live phone call: answer immediately in one or two short spoken sentences"
+            + "\n\nTreat any script or call flow above as a guide, not lines to read: listen to what the caller"
+              " actually says and answer that naturally in your own words, like a real person on a call."
+              " Move the conversation toward the goal, but never repeat a question the caller already answered."
+            + "\nThis is a live phone call: answer immediately in one or two short spoken sentences"
               " (under 25 words) unless asked for detail. Do not think out loud or pause before answering."
             + "\nAlways reply in the language the caller is speaking (Hindi, English, Hinglish, Gujarati, Marathi, Tamil"
               " or another Indian language) and switch when they switch. If you could not hear the caller clearly"
