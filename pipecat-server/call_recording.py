@@ -19,6 +19,19 @@ RATE = 16000
 MAX_SECONDS = 30 * 60
 
 
+def level(x: np.ndarray, target_peak: float, max_gain: float) -> np.ndarray:
+    """Scales one side of the call so its speech peaks near target_peak (gain capped at max_gain)."""
+    if x.size == 0:
+        return x
+    a = np.abs(x)
+    loud = a[a > 200]  # ignore silence and line hiss when measuring the speaking level
+    if loud.size < RATE // 10:
+        return x
+    peak = float(np.percentile(loud, 99))
+    gain = min(max_gain, target_peak / max(peak, 1.0))
+    return x * gain
+
+
 class CallRecorder:
     def __init__(self):
         self._user = bytearray()
@@ -48,18 +61,22 @@ class CallRecorder:
         end = min(end, MAX_SECONDS * RATE)
         if end < RATE:  # under a second: nothing worth keeping
             return None
-        mix = np.zeros(end, dtype=np.int32)
-        mix[:min(len(user), end)] += user[:end]
+        bot = np.zeros(end, dtype=np.float32)
         for t, pcm in self._bot:
             start = max(0, int((t - self._t0) * RATE))
-            chunk = np.frombuffer(pcm, dtype=np.int16).astype(np.int32)[: max(0, end - start)]
-            mix[start:start + len(chunk)] += chunk
+            chunk = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)[: max(0, end - start)]
+            bot[start:start + len(chunk)] += chunk
+        caller = np.zeros(end, dtype=np.float32)
+        caller[:min(len(user), end)] = user[:end]
+        # Phone audio from the caller arrives far quieter than the agent's voice, so in a plain mix the
+        # customer could not be heard (28 Oct). Bring both sides to the same speaking level first.
+        mix = level(caller, 9000.0, 12.0) + level(bot, 9000.0, 2.0)
         out = io.BytesIO()
         with wave.open(out, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(RATE)
-            w.writeframes(np.clip(mix, -32768, 32767).astype(np.int16).tobytes())
+            w.writeframes(np.clip(np.tanh(mix / 32768.0 * 1.1) * 32767.0, -32768, 32767).astype(np.int16).tobytes())
         return out.getvalue()
 
 

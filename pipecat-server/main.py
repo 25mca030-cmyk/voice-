@@ -1282,6 +1282,62 @@ async def forget_greeting_db(call_id: str, token: str):
         pass
 
 
+HELLO_WAIT_S = float(os.environ.get("HELLO_WAIT_SECS", "2.5"))
+
+
+async def wait_for_hello(ws: WebSocket) -> str:
+    """Outbound calls: the person answers with "Hello?". Greet right after they finish it, or after
+    HELLO_WAIT_S if they stay silent, so the greeting never talks over their hello.
+
+    Returns "hello", "silence" or "closed"."""
+    started = time.monotonic()
+    deadline = started + HELLO_WAIT_S
+    floor = None
+    speech_ms = quiet_ms = 0.0
+    heard = False
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return "hello" if heard else "silence"
+        try:
+            raw = await asyncio.wait_for(ws.receive(), timeout=left)
+        except asyncio.TimeoutError:
+            return "hello" if heard else "silence"
+        except Exception:
+            return "closed"
+        if raw.get("type") == "websocket.disconnect":
+            return "closed"
+        data = raw.get("text") or (raw.get("bytes") or b"").decode("utf-8", "ignore")
+        try:
+            msg = json.loads(data)
+        except Exception:
+            continue
+        if msg.get("event") == "stop":
+            return "closed"
+        media = msg.get("media") or {}
+        if msg.get("event") != "media" or not media.get("payload") or media.get("track", "inbound") != "inbound":
+            continue
+        x = np.frombuffer(base64.b64decode(media["payload"]), dtype=np.int16).astype(np.float32)
+        if not x.size:
+            continue
+        rms = float(np.sqrt(np.mean(x * x)))
+        ms = 1000 * x.size / 16000
+        # Background level: follows quiet moments quickly, creeps up only slowly while someone talks.
+        floor = rms if floor is None else (0.5 * floor + 0.5 * rms if rms < floor else 0.995 * floor + 0.005 * rms)
+        if rms > max(250.0, floor * 2.5):
+            speech_ms += ms
+            quiet_ms = 0.0
+            if not heard and speech_ms >= 100:
+                heard = True
+                deadline = time.monotonic() + 1.5  # a hello is short; never wait longer than this
+        else:
+            quiet_ms += ms
+            if heard and quiet_ms >= 300:
+                return "hello"
+            if not heard and quiet_ms >= 200:
+                speech_ms = 0.0
+
+
 async def play_instant_greeting(ws: WebSocket, stream_id: str, agent_id: str, opened_at: float) -> float:
     """Sends this agent's saved greeting to Vobiz the moment the call connects, before the agent loads.
 
@@ -1381,8 +1437,13 @@ async def phone_ws(ws: WebSocket):
                 agent_id = ""
         pre_greeted_until = 0.0
         if re.fullmatch(r"[0-9a-fA-F-]{36}", agent_id or "") and stream_id:
-            await load_saved_greeting(call_id, ws.query_params.get("token", ""), agent_id)
-            pre_greeted_until = await play_instant_greeting(ws, stream_id, agent_id, stream_opened_at)
+            if await load_saved_greeting(call_id, ws.query_params.get("token", ""), agent_id):
+                heard = await wait_for_hello(ws)
+                if heard == "closed":
+                    logger.info(f"call {call_id[:8]} ended before the greeting")  # run_call saves it as ended
+                else:
+                    logger.info(f"greeting after caller {heard}, {(time.time() - stream_opened_at) * 1000:.0f} ms after pickup")
+                    pre_greeted_until = await play_instant_greeting(ws, stream_id, agent_id, stream_opened_at)
         await run_call(ws, call_id, ws.query_params.get("token", ""), phone=True, stream_id=stream_id,
                        session_task=session_task, stream_opened_at=stream_opened_at,
                        agent_id=agent_id if re.fullmatch(r"[0-9a-fA-F-]{36}", agent_id or "") else "",

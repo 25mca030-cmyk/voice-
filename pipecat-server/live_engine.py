@@ -34,9 +34,9 @@ PINNED = os.environ.get("LIVE_MODEL", "gemini-3.1-flash-live-preview").strip()
 _BAD_PINNED: set[str] = set()
 # 250 ms cut callers off mid-sentence (the agent answered 4-66 ms after they paused) and it then
 # misunderstood them. 450 ms with low end-sensitivity lets people finish; still under a second to reply.
-# 28 Oct: callers asked that the agent not jump in the instant they pause; 700 ms feels natural on a
-# phone line and still answers well under 1.5 s.
-SILENCE_MS = int(os.environ.get("LIVE_SILENCE_MS", "700"))
+# 28 Oct: not the instant the caller pauses (that cut people off), but a quick follow-up: 550 ms of
+# silence ends the caller's turn.
+SILENCE_MS = int(os.environ.get("LIVE_SILENCE_MS", "550"))
 
 
 def _hash(key: str) -> str:
