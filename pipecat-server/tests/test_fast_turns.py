@@ -123,3 +123,69 @@ class InboundBatching(unittest.TestCase):
         self.assertIsNone(asyncio.run(ser.deserialize(pkt)))
         frame = asyncio.run(ser.deserialize(pkt))
         self.assertEqual(len(frame.audio), 1280)
+
+
+class BargeIn(unittest.IsolatedAsyncioTestCase):
+    async def run_guard(self, loud_frames):
+        import numpy as np
+        from pipecat.frames.frames import InputAudioRawFrame
+        g = main.BargeInGuard()
+        out = []
+
+        async def push(frame, direction=FrameDirection.DOWNSTREAM):
+            if isinstance(frame, InputAudioRawFrame):
+                out.append(int(np.abs(np.frombuffer(frame.audio, dtype=np.int16)).max()))
+        g.push_frame = push
+        await g.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
+        loud = (np.ones(640, dtype=np.int16) * 4000).tobytes()  # 40 ms
+        for _ in range(loud_frames):
+            await g.process_frame(InputAudioRawFrame(audio=loud, sample_rate=16000, num_channels=1), FrameDirection.DOWNSTREAM)
+        return out
+
+    async def test_short_noise_is_silenced_while_agent_talks(self):
+        out = await self.run_guard(3)  # 120 ms "hmm"
+        self.assertTrue(all(v == 0 for v in out))
+
+    async def test_sustained_speech_interrupts(self):
+        out = await self.run_guard(12)  # 480 ms of real speech
+        self.assertTrue(any(v > 0 for v in out))
+
+
+class SavedAgentStart(unittest.TestCase):
+    def test_second_call_starts_without_waiting_for_voiceos(self):
+        import json
+        from fastapi.testclient import TestClient
+        aid = "11111111-2222-3333-4444-555555555555"
+        agent = {"name": "a", "instructions": "x", "opening": "", "language": "English", "llm": "google/x",
+                 "stt": "sarvam", "tts": "sarvam", "voice": "ishita", "tools": []}
+        main._SESSION_CACHE[aid] = {"agent": agent, "keys": {"gemini": "k"}}
+        started = []
+
+        async def slow_voiceos(path, payload):
+            if path == "session":
+                await asyncio.sleep(1.5)
+                return {"agent": agent, "keys": {"gemini": "k"}}
+            return {}
+
+        async def fake_pick(key):
+            started.append(time.monotonic())
+            return "gemini-3.8-live"
+
+        async def ok(key, model):
+            return True
+
+        async def lookup(call_id, token):
+            return aid
+
+        async def no_connect(self, *a, **k):
+            return None
+        from unittest.mock import patch
+        with patch.object(main, "voiceos", slow_voiceos), patch.object(main, "pick_live_model", fake_pick), \
+                patch.object(main, "thinking_supported", ok), patch.object(main, "lookup_call_agent", lookup), \
+                patch("pipecat.services.google.gemini_live.llm.GeminiLiveLLMService._connect", no_connect):
+            t0 = time.monotonic()
+            with TestClient(main.app).websocket_connect("/phone?call=c&token=t") as ws:
+                ws.send_text(json.dumps({"event": "start", "start": {"streamId": "S"}}))
+                time.sleep(0.6)
+                ws.send_text(json.dumps({"event": "stop"}))
+        self.assertTrue(started and started[0] - t0 < 1.0)
